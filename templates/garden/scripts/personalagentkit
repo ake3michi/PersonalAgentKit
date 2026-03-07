@@ -1,0 +1,1940 @@
+#!/usr/bin/env bash
+# personalagentkit — run a goal and record what happened
+#
+# Usage:
+#   ./personalagentkit run <goal-file>
+#   ./personalagentkit run goals/002-something.md
+#
+# Produces:
+#   runs/<goal-id>/meta.json   — structured run record
+#   runs/<goal-id>/output.md   — agent output
+#
+# Principles honored:
+#   P2: meta.json is schema-validated structure
+#   P5: every run produces a record before the agent speaks
+#   P6: cost fields are required in meta.json at completion
+#   P7: agent is prompted to write reflection.md
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCHEMA="$REPO_ROOT/schema/run.schema.json"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die() { echo "personalagentkit: $*" >&2; exit 1; }
+
+require() {
+  command -v "$1" &>/dev/null || die "required tool not found: $1"
+}
+
+# flock shim for macOS (no flock without brew install util-linux).
+# When flock is unavailable, the subshell still runs — just without cross-process locking.
+if ! command -v flock &>/dev/null; then
+  flock() { return 0; }
+fi
+
+iso_now() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+goal_id_from_file() {
+  # goals/001-bootstrap.md → 001-bootstrap
+  basename "$1" .md
+}
+
+parse_goal_meta() {
+  # Usage: parse_goal_meta <goal-file> <field>
+  # field: assigned_to | depends_on | submitted_by
+  # Returns the field value, or empty string if not present or no frontmatter.
+  local goal_file="$1" field="$2"
+  [[ -f "$goal_file" ]] || { echo ""; return; }
+  local first_line
+  first_line=$(head -1 "$goal_file")
+  [[ "$first_line" == "---" ]] || { echo ""; return; }
+  # Extract lines between first --- and second ---, strip the closing ---
+  sed -n '2,/^---$/p' "$goal_file" | grep -v '^---$' \
+    | grep "^${field}:" | sed "s/^${field}:[[:space:]]*//" | head -1 || true
+}
+
+is_dep_satisfied() {
+  # Usage: is_dep_satisfied <dep-slug>
+  # dep-slug may be "NNN-slug" (exact match) or "slug" (match by suffix *-slug)
+  # Returns 0 if a successful run matching the slug exists, 1 otherwise.
+  local dep="$1"
+  local pattern
+  if [[ "$dep" =~ ^[0-9] ]]; then
+    pattern="${dep}"
+  else
+    pattern="*-${dep}"
+  fi
+  # Check root runs
+  local run_dir
+  for run_dir in "$REPO_ROOT/runs"/${pattern}/; do
+    [[ -f "${run_dir}meta.json" ]] || continue
+    local st
+    st=$(jq -r '.status // ""' "${run_dir}meta.json" 2>/dev/null)
+    [[ "$st" == "success" ]] && return 0
+  done
+  # Check plant runs
+  local plant_path
+  for plant_path in "$REPO_ROOT/plants"/*/; do
+    [[ -d "$plant_path" ]] || continue
+    for run_dir in "${plant_path}runs"/${pattern}/; do
+      [[ -f "${run_dir}meta.json" ]] || continue
+      local st
+      st=$(jq -r '.status // ""' "${run_dir}meta.json" 2>/dev/null)
+      [[ "$st" == "success" ]] && return 0
+    done
+  done
+  return 1
+}
+
+# ── agent invocation ──────────────────────────────────────────────────────────
+#
+# invoke_agent <run_dir> <prompt>
+#   Starts claude with stream-json output, writes events.jsonl + output.md + stderr.txt
+#   Runs a no-event watchdog in background (default 300s — catches multi-minute hangs
+#   without firing on legitimate silence during nested subprocess calls like ./personalagentkit plant).
+#   Sets global AGENT_STATUS to: success | failure | killed
+#
+invoke_agent() {
+  local run_dir="$1"
+  local prompt="$2"
+  local events_file="$run_dir/events.jsonl"
+
+  # Start claude in background, streaming NDJSON events to events.jsonl
+  # --verbose is required for --output-format stream-json with --print
+  echo "$prompt" | CLAUDECODE="" claude \
+        --model claude-sonnet-4-6 \
+        --output-format stream-json \
+        --verbose \
+        --dangerously-skip-permissions \
+        >> "$events_file" \
+        2>"$run_dir/stderr.txt" &
+  local claude_pid=$!
+
+  # No-event watchdog: kills claude if no new events for 600s (10 minutes)
+  # Catches genuine hangs (e.g. stuck kevent64 network wait, confirmed at 43min)
+  # without firing on legitimate silence during nested subprocess calls (./personalagentkit plant etc.)
+  # Still expect occasional false positives on deeply nested calls (2+ levels deep).
+  (
+    last_size=0
+    idle=0
+    while kill -0 "$claude_pid" 2>/dev/null; do
+      sleep 10
+      cur_size=$(wc -l < "$events_file" 2>/dev/null | tr -d ' ' || echo 0)
+      if (( cur_size == last_size )); then
+        idle=$(( idle + 10 ))
+        if (( idle >= 600 )); then
+          echo '{"type":"watchdog_killed","reason":"no events for 600s"}' >> "$events_file"
+          kill "$claude_pid" 2>/dev/null
+          break
+        fi
+      else
+        idle=0
+        last_size=$cur_size
+      fi
+    done
+  ) &
+  local watchdog_pid=$!
+
+  # Wait for claude to finish; capture exit code without triggering set -e
+  local claude_exit=0
+  wait "$claude_pid" || claude_exit=$?
+
+  # Kill watchdog — prevent zombie if claude exits normally
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  # Determine status
+  AGENT_STATUS="success"
+  if grep -q '"type":"watchdog_killed"' "$events_file" 2>/dev/null; then
+    AGENT_STATUS="killed"
+  elif (( claude_exit != 0 )); then
+    AGENT_STATUS="failure"
+  fi
+
+  # Extract text output from the result event
+  local result_line
+  result_line=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1)
+  if [[ -n "$result_line" ]]; then
+    echo "$result_line" | jq -r '.result // "no output"' > "$run_dir/output.md" 2>/dev/null \
+      || echo "no output" > "$run_dir/output.md"
+  else
+    echo "no output" > "$run_dir/output.md"
+  fi
+}
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+
+cmd_run() {
+  local goal_file="${1:-}"
+  [[ -n "$goal_file" ]] || die "usage: personalagentkit run <goal-file>"
+  [[ -f "$REPO_ROOT/$goal_file" ]] || die "goal file not found: $goal_file"
+
+  require claude
+  require jq
+
+  local goal_id
+  goal_id=$(goal_id_from_file "$goal_file")
+
+  local run_dir="$REPO_ROOT/runs/$goal_id"
+  mkdir -p "$run_dir"
+
+  local meta="$run_dir/meta.json"
+  local output="$run_dir/output.md"
+  local started_at
+  started_at=$(iso_now)
+
+  # ── write initial run record (P5: record before agent acts) ──────────────
+  local submitted_by="${TELOS_SUBMITTED_BY:-}"
+  jq -n \
+    --arg run_id       "$goal_id" \
+    --arg goal_file    "$goal_file" \
+    --arg started      "$started_at" \
+    --arg agent        "claude-sonnet-4-6" \
+    --arg submitted_by "$submitted_by" \
+    '{
+      run_id:     $run_id,
+      goal_file:  $goal_file,
+      started_at: $started,
+      completed_at: null,
+      status:     "running",
+      agent:      $agent,
+      cost:       null,
+      outputs:    [],
+      notes:      null
+    } | if $submitted_by != "" then . + {submitted_by: $submitted_by} else . end' > "$meta"
+
+  echo "personalagentkit: run $goal_id started at $started_at"
+  echo "personalagentkit: record → $meta"
+
+  # ── build the prompt ──────────────────────────────────────────────────────
+  local motivation
+  motivation=$(cat "$REPO_ROOT/MOTIVATION.md")
+  local goal_content
+  goal_content=$(cat "$REPO_ROOT/$goal_file")
+
+  local memory_section=""
+  if [[ -f "$REPO_ROOT/memory/MEMORY.md" ]]; then
+    local memory_content
+    memory_content=$(cat "$REPO_ROOT/memory/MEMORY.md")
+    memory_section=$(cat <<MEMORY
+
+---
+
+# Memory
+
+$memory_content
+MEMORY
+)
+  fi
+
+  local prompt
+  prompt=$(cat <<PROMPT
+You are a capable agent working on a goal within the PersonalAgentKit system.
+
+# Motivation
+
+$motivation
+$memory_section
+
+---
+
+# Goal
+
+$goal_content
+
+---
+
+Your working directory is $REPO_ROOT. Begin.
+PROMPT
+)
+
+  # ── invoke agent, stream events to events.jsonl ───────────────────────────
+  invoke_agent "$run_dir" "$prompt"
+  local status="$AGENT_STATUS"
+
+  local completed_at
+  completed_at=$(iso_now)
+
+  # ── extract cost from stream result event (P6: cost is always visible) ────
+  local result_event
+  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
+  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
+  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
+  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
+  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
+  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
+  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+
+  # ── update meta.json with completion data ─────────────────────────────────
+  local outputs='["output.md"]'
+  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
+  jq \
+    --arg completed     "$completed_at" \
+    --arg status        "$status" \
+    --argjson input     "$input_tokens" \
+    --argjson output    "$output_tokens" \
+    --argjson cread     "$cache_read" \
+    --argjson cwrite    "$cache_write" \
+    --arg cost          "$cost_usd" \
+    --argjson turns     "$num_turns" \
+    --argjson dur       "$duration_ms" \
+    --argjson outputs   "$outputs" \
+    '.completed_at = $completed
+   | .status      = $status
+   | .cost        = {
+       input_tokens:        $input,
+       output_tokens:       $output,
+       cache_read_tokens:   $cread,
+       cache_write_tokens:  $cwrite,
+       actual_usd:          ($cost | tonumber)
+     }
+   | .num_turns   = $turns
+   | .duration_ms = $dur
+   | .outputs     = $outputs' \
+    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+
+  # ── validate meta.json (P2: schema is a contract, not documentation) ──────
+  local validation_errors
+  validation_errors=$(jq -r '
+    [
+      (if (.run_id       | type) != "string"  then "run_id: missing or not a string"         else empty end),
+      (if (.goal_file    | type) != "string"  then "goal_file: missing or not a string"       else empty end),
+      (if (.started_at   | type) != "string"  then "started_at: missing or not a string"      else empty end),
+      (if (.status       | type) != "string"  then "status: missing or not a string"          else empty end),
+      (if (.completed_at | type) != "string"  then "completed_at: missing or not a string"    else empty end),
+      (if (.status == "killed") then empty elif (.num_turns   | type) != "number" then "num_turns: missing or not an integer"   else empty end),
+      (if (.status == "killed") then empty elif (.duration_ms | type) != "number" then "duration_ms: missing or not an integer" else empty end),
+      (if ((.cost.actual_usd | type) != "number") then "cost.actual_usd: missing or not a number" else empty end)
+    ] | .[]
+  ' "$meta" 2>/dev/null || true)
+
+  if [[ -n "$validation_errors" ]]; then
+    echo "personalagentkit: WARNING: meta.json validation failed for $goal_id:" >&2
+    while IFS= read -r line; do
+      echo "  - $line" >&2
+    done <<< "$validation_errors"
+  fi
+
+  if [[ ! -f "$run_dir/reflection.md" ]]; then
+    echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
+  fi
+
+  echo "personalagentkit: run $goal_id completed ($status) at $completed_at"
+  echo "personalagentkit: cost = \$$cost_usd USD"
+  echo "personalagentkit: output → $run_dir/output.md"
+
+  # ── auto-commit run directory (P8: git history is the system's memory) ────
+  (
+    flock -x 200
+    git -C "$REPO_ROOT" add "$run_dir" "$REPO_ROOT/$goal_file" 2>/dev/null
+    git -C "$REPO_ROOT" add -A 2>/dev/null
+    if git -C "$REPO_ROOT" commit -m "run $goal_id: finalize" 2>/dev/null; then
+      echo "personalagentkit: committed run $goal_id"
+    else
+      echo "personalagentkit: WARNING: auto-commit failed for $goal_id" >&2
+    fi
+  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
+}
+
+cmd_status() {
+  local runs_dir="$REPO_ROOT/runs"
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  # ── in-flight runs (root + all plants) shown first ─────────────────────────
+  local running_found=false
+  local meta
+  for meta in \
+      "$runs_dir"/*/meta.json \
+      "$REPO_ROOT/plants"/*/runs/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    local status_raw
+    status_raw=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+    [[ "$status_raw" == "running" ]] || continue
+
+    if [[ "$running_found" == "false" ]]; then
+      printf "  RUNNING\n"
+      running_found=true
+    fi
+
+    local run_id started_at
+    run_id=$(jq -r '.run_id // ""' "$meta" 2>/dev/null)
+    started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+
+    local started_epoch elapsed em es
+    started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+    elapsed=$(( now_epoch - started_epoch ))
+    em=$(( elapsed / 60 ))
+    es=$(( elapsed % 60 ))
+
+    local events_file event_count
+    events_file="$(dirname "$meta")/events.jsonl"
+    event_count=0
+    [[ -f "$events_file" ]] && event_count=$(wc -l < "$events_file" 2>/dev/null | tr -d ' ' || echo 0)
+
+    local display_id
+    if [[ "$meta" == *"/plants/"* ]]; then
+      local plant_name
+      plant_name=$(echo "$meta" | sed 's|.*/plants/\([^/]*\)/.*|\1|')
+      display_id="${plant_name}/${run_id}"
+    else
+      display_id="$run_id"
+    fi
+
+    printf "  %-40s  %dm %02ds   %s events\n" "$display_id" "$em" "$es" "$event_count"
+  done
+  [[ "$running_found" == "true" ]] && printf "\n"
+
+  # ── completed runs table (root + all plant runs, sorted by NNN) ────────────
+  printf "%-36s  %-10s  %-10s  %-6s  %s\n" "RUN" "STATUS" "COST" "TURNS" "DURATION"
+
+  # collect all meta.json paths from root runs/ and all plant runs/
+  local all_metas=()
+  for meta in "$runs_dir"/*/meta.json \
+              "$REPO_ROOT/plants"/*/runs/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    all_metas+=("$meta")
+  done
+
+  # sort by run directory name (NNN-slug sorts correctly lexicographically)
+  local sorted_metas
+  IFS=$'\n' sorted_metas=($(printf '%s\n' "${all_metas[@]}" | sort -t/ -k1,1 || true))
+  unset IFS
+
+  for meta in "${sorted_metas[@]:-}"; do
+    [[ -f "$meta" ]] || continue
+    local run_id cost_raw turns dur_ms status_raw started_at
+    run_id=$(jq -r '.run_id // ""' "$meta" 2>/dev/null)
+    cost_raw=$(jq -r '.cost.actual_usd // .cost.estimated_usd // "null"' "$meta" 2>/dev/null)
+    turns=$(jq -r '.num_turns // "null"' "$meta" 2>/dev/null)
+    dur_ms=$(jq -r '.duration_ms // "null"' "$meta" 2>/dev/null)
+    status_raw=$(jq -r '.status // "null"' "$meta" 2>/dev/null)
+    started_at=$(jq -r '.started_at // "null"' "$meta" 2>/dev/null)
+
+    # prefix plant runs with plant name for clarity
+    local display_id="$run_id"
+    if [[ "$meta" == *"/plants/"* ]]; then
+      local plant_name
+      plant_name=$(echo "$meta" | sed 's|.*/plants/\([^/]*\)/.*|\1|')
+      display_id="${plant_name}/${run_id}"
+    fi
+
+    if [[ "$cost_raw" == "null" ]]; then
+      cost_fmt="-"
+    else
+      cost_fmt=$(printf '$%.4f' "$cost_raw")
+    fi
+
+    if [[ "$turns" == "null" ]]; then
+      turns_fmt="-"
+    else
+      turns_fmt="$turns"
+    fi
+
+    if [[ "$dur_ms" == "null" ]]; then
+      dur_fmt="-"
+    else
+      dur_s=$(( dur_ms / 1000 ))
+      dur_fmt="${dur_s}s"
+    fi
+
+    local status_fmt
+    if [[ "$status_raw" == "running" && "$started_at" != "null" ]]; then
+      local started_epoch elapsed
+      started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+      elapsed=$(( now_epoch - started_epoch ))
+      if (( elapsed > 7200 )); then
+        status_fmt="stale"
+      else
+        status_fmt="running"
+      fi
+    elif [[ "$status_raw" == "null" ]]; then
+      status_fmt="-"
+    else
+      status_fmt="$status_raw"
+    fi
+
+    printf "%-36s  %-10s  %-10s  %-6s  %s\n" "$display_id" "$status_fmt" "$cost_fmt" "$turns_fmt" "$dur_fmt"
+  done
+}
+
+cmd_plant() {
+  local seed_name="${1:-}"
+  local plant_name="${2:-}"
+  [[ -n "$seed_name" ]]  || die "usage: personalagentkit plant <seed-name> <plant-name>"
+  [[ -n "$plant_name" ]] || die "usage: personalagentkit plant <seed-name> <plant-name>"
+
+  require claude
+  require jq
+
+  local seed_file="$REPO_ROOT/seeds/${seed_name}.md"
+  [[ -f "$seed_file" ]] || die "seed not found: seeds/${seed_name}.md"
+
+  local plant_dir="$REPO_ROOT/plants/$plant_name"
+  [[ ! -d "$plant_dir" ]] || die "plant already exists: $plant_dir"
+
+  # ── scaffold the plant ──────────────────────────────────────────────────
+  mkdir -p "$plant_dir/goals" "$plant_dir/runs/001-genesis" "$plant_dir/memory"
+
+  cp "$REPO_ROOT/MOTIVATION.md" "$plant_dir/MOTIVATION.md"
+  cp "$seed_file" "$plant_dir/goals/001-genesis.md"
+  echo "$seed_name" > "$plant_dir/seed"
+
+  local run_dir="$plant_dir/runs/001-genesis"
+  local meta="$run_dir/meta.json"
+  local output="$run_dir/output.md"
+  local started_at
+  started_at=$(iso_now)
+
+  echo "personalagentkit: planting $plant_name from seed $seed_name"
+  echo "personalagentkit: plant dir → $plant_dir"
+
+  # ── write initial run record ─────────────────────────────────────────────
+  jq -n \
+    --arg run_id    "001-genesis" \
+    --arg goal_file "goals/001-genesis.md" \
+    --arg started   "$started_at" \
+    --arg agent     "claude-sonnet-4-6" \
+    '{
+      run_id:     $run_id,
+      goal_file:  $goal_file,
+      started_at: $started,
+      completed_at: null,
+      status:     "running",
+      agent:      $agent,
+      cost:       null,
+      outputs:    [],
+      notes:      null
+    }' > "$meta"
+
+  # ── build the prompt ──────────────────────────────────────────────────────
+  local motivation
+  motivation=$(cat "$plant_dir/MOTIVATION.md")
+  local goal_content
+  goal_content=$(cat "$plant_dir/goals/001-genesis.md")
+
+  local prompt
+  prompt=$(cat <<PROMPT
+You are a capable agent working on a goal within the PersonalAgentKit system.
+
+# Motivation
+
+$motivation
+
+---
+
+# Goal
+
+$goal_content
+
+---
+
+Your working directory is $plant_dir. Begin.
+PROMPT
+)
+
+  # ── invoke agent, stream events to events.jsonl ───────────────────────────
+  invoke_agent "$run_dir" "$prompt"
+  local status="$AGENT_STATUS"
+
+  local completed_at
+  completed_at=$(iso_now)
+
+  local result_event
+  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
+  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
+  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
+  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
+  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
+  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
+  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+
+  local outputs='["output.md"]'
+  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
+  jq \
+    --arg completed     "$completed_at" \
+    --arg status        "$status" \
+    --argjson input     "$input_tokens" \
+    --argjson output    "$output_tokens" \
+    --argjson cread     "$cache_read" \
+    --argjson cwrite    "$cache_write" \
+    --arg cost          "$cost_usd" \
+    --argjson turns     "$num_turns" \
+    --argjson dur       "$duration_ms" \
+    --argjson outputs   "$outputs" \
+    '.completed_at = $completed
+   | .status      = $status
+   | .cost        = {
+       input_tokens:        $input,
+       output_tokens:       $output,
+       cache_read_tokens:   $cread,
+       cache_write_tokens:  $cwrite,
+       actual_usd:          ($cost | tonumber)
+     }
+   | .num_turns   = $turns
+   | .duration_ms = $dur
+   | .outputs     = $outputs' \
+    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+
+  if [[ ! -f "$run_dir/reflection.md" ]]; then
+    echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
+  fi
+
+  echo "personalagentkit: genesis run completed ($status) at $completed_at"
+  echo "personalagentkit: cost = \$$cost_usd USD"
+  echo "personalagentkit: plant $plant_name is alive → $plant_dir"
+
+  # ── auto-commit run directory (P8: git history is the system's memory) ────
+  git -C "$REPO_ROOT" add "$run_dir" "$plant_dir/goals/001-genesis.md" 2>/dev/null
+  git -C "$REPO_ROOT" add -A 2>/dev/null
+  if git -C "$REPO_ROOT" commit -m "run 001-genesis: finalize" 2>/dev/null; then
+    echo "personalagentkit: committed run 001-genesis"
+  else
+    echo "personalagentkit: WARNING: auto-commit failed for 001-genesis" >&2
+  fi
+}
+
+cmd_plant_run() {
+  local plant_name="${1:-}"
+  local goal_rel="${2:-}"
+  [[ -n "$plant_name" ]]  || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
+  [[ -n "$goal_rel" ]]    || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
+
+  require claude
+  require jq
+
+  local plant_dir="$REPO_ROOT/plants/$plant_name"
+  [[ -d "$plant_dir" ]] || die "plant not found: $plant_dir"
+
+  local goal_file="$plant_dir/$goal_rel"
+  # fall back to repo-root-relative path (supports unified queue where goals live in root goals/)
+  [[ -f "$goal_file" ]] || goal_file="$REPO_ROOT/$goal_rel"
+  [[ -f "$goal_file" ]] || die "goal file not found: $goal_rel (checked plant dir and repo root)"
+
+  local goal_id
+  goal_id=$(goal_id_from_file "$goal_rel")
+
+  local run_dir="$plant_dir/runs/$goal_id"
+  mkdir -p "$run_dir"
+
+  local meta="$run_dir/meta.json"
+  local output="$run_dir/output.md"
+  local started_at
+  started_at=$(iso_now)
+
+  # ── write initial run record (P5) ─────────────────────────────────────────
+  local submitted_by="${TELOS_SUBMITTED_BY:-}"
+  jq -n \
+    --arg run_id       "$goal_id" \
+    --arg goal_file    "$goal_rel" \
+    --arg started      "$started_at" \
+    --arg agent        "claude-sonnet-4-6" \
+    --arg submitted_by "$submitted_by" \
+    '{
+      run_id:     $run_id,
+      goal_file:  $goal_file,
+      started_at: $started,
+      completed_at: null,
+      status:     "running",
+      agent:      $agent,
+      cost:       null,
+      outputs:    [],
+      notes:      null
+    } | if $submitted_by != "" then . + {submitted_by: $submitted_by} else . end' > "$meta"
+
+  echo "personalagentkit: plant-run $plant_name/$goal_id started at $started_at"
+  echo "personalagentkit: record → $meta"
+
+  # ── build the prompt ──────────────────────────────────────────────────────
+  local motivation
+  motivation=$(cat "$plant_dir/MOTIVATION.md")
+  local goal_content
+  goal_content=$(cat "$goal_file")
+
+  local memory_section=""
+  if [[ -f "$plant_dir/memory/MEMORY.md" ]]; then
+    local memory_content
+    memory_content=$(cat "$plant_dir/memory/MEMORY.md")
+    memory_section=$(cat <<MEMORY
+
+---
+
+# Memory
+
+$memory_content
+MEMORY
+)
+  fi
+
+  local prompt
+  prompt=$(cat <<PROMPT
+You are a capable agent working on a goal within the PersonalAgentKit system.
+
+# Motivation
+
+$motivation
+$memory_section
+
+---
+
+# Goal
+
+$goal_content
+
+---
+
+Your working directory is $plant_dir. Begin.
+PROMPT
+)
+
+  # ── invoke agent, stream events to events.jsonl ───────────────────────────
+  invoke_agent "$run_dir" "$prompt"
+  local status="$AGENT_STATUS"
+
+  local completed_at
+  completed_at=$(iso_now)
+
+  local result_event
+  result_event=$(grep '"type":"result"' "$run_dir/events.jsonl" 2>/dev/null | tail -1 || true)
+  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
+  input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
+  output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
+  cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
+  cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
+  cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
+  num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
+  duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
+
+  local outputs='["output.md"]'
+  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
+  jq \
+    --arg completed     "$completed_at" \
+    --arg status        "$status" \
+    --argjson input     "$input_tokens" \
+    --argjson output    "$output_tokens" \
+    --argjson cread     "$cache_read" \
+    --argjson cwrite    "$cache_write" \
+    --arg cost          "$cost_usd" \
+    --argjson turns     "$num_turns" \
+    --argjson dur       "$duration_ms" \
+    --argjson outputs   "$outputs" \
+    '.completed_at = $completed
+   | .status      = $status
+   | .cost        = {
+       input_tokens:        $input,
+       output_tokens:       $output,
+       cache_read_tokens:   $cread,
+       cache_write_tokens:  $cwrite,
+       actual_usd:          ($cost | tonumber)
+     }
+   | .num_turns   = $turns
+   | .duration_ms = $dur
+   | .outputs     = $outputs' \
+    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+
+  # ── validate meta.json ────────────────────────────────────────────────────
+  local validation_errors
+  validation_errors=$(jq -r '
+    [
+      (if (.run_id       | type) != "string"  then "run_id: missing or not a string"         else empty end),
+      (if (.goal_file    | type) != "string"  then "goal_file: missing or not a string"       else empty end),
+      (if (.started_at   | type) != "string"  then "started_at: missing or not a string"      else empty end),
+      (if (.status       | type) != "string"  then "status: missing or not a string"          else empty end),
+      (if (.completed_at | type) != "string"  then "completed_at: missing or not a string"    else empty end),
+      (if (.status == "killed") then empty elif (.num_turns   | type) != "number" then "num_turns: missing or not an integer"   else empty end),
+      (if (.status == "killed") then empty elif (.duration_ms | type) != "number" then "duration_ms: missing or not an integer" else empty end),
+      (if ((.cost.actual_usd | type) != "number") then "cost.actual_usd: missing or not a number" else empty end)
+    ] | .[]
+  ' "$meta" 2>/dev/null || true)
+
+  if [[ -n "$validation_errors" ]]; then
+    echo "personalagentkit: WARNING: meta.json validation failed for $goal_id:" >&2
+    while IFS= read -r line; do
+      echo "  - $line" >&2
+    done <<< "$validation_errors"
+  fi
+
+  if [[ ! -f "$run_dir/reflection.md" ]]; then
+    echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
+  fi
+
+  echo "personalagentkit: plant-run $plant_name/$goal_id completed ($status) at $completed_at"
+  echo "personalagentkit: cost = \$$cost_usd USD"
+  echo "personalagentkit: output → $output"
+
+  # ── auto-commit run directory (P8: git history is the system's memory) ────
+  (
+    flock -x 200
+    git -C "$REPO_ROOT" add "$run_dir" "$goal_file" 2>/dev/null
+    git -C "$REPO_ROOT" add -A 2>/dev/null
+    if git -C "$REPO_ROOT" commit -m "run $goal_id: finalize" 2>/dev/null; then
+      echo "personalagentkit: committed run $goal_id"
+    else
+      echo "personalagentkit: WARNING: auto-commit failed for $goal_id" >&2
+    fi
+  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
+}
+
+cmd_garden() {
+  local plants_dir="$REPO_ROOT/plants"
+  if [[ ! -d "$plants_dir" ]] || [[ -z "$(ls -A "$plants_dir" 2>/dev/null)" ]]; then
+    echo "garden is empty — plant a seed with: personalagentkit plant <seed> <name>"
+    return
+  fi
+
+  printf "%-20s  %-16s  %-10s  %-10s  %-6s  %s\n" "PLANT" "LATEST RUN" "STATUS" "COST" "TURNS" "DURATION"
+  for plant_path in "$plants_dir"/*/; do
+    [[ -d "$plant_path" ]] || continue
+    local plant_name
+    plant_name=$(basename "$plant_path")
+
+    local runs_dir="$plant_path/runs"
+    if [[ ! -d "$runs_dir" ]] || [[ -z "$(ls -A "$runs_dir" 2>/dev/null)" ]]; then
+      printf "%-20s  %-16s  %-10s  %-10s  %-6s  %s\n" "$plant_name" "(no runs)" "-" "-" "-" "-"
+      continue
+    fi
+
+    # find the latest run by directory name (lexicographic, NNN-slug sorts correctly)
+    local latest_run_dir
+    latest_run_dir=$(ls -d "$runs_dir"/*/ 2>/dev/null | sort | tail -1)
+    local latest_run_name
+    latest_run_name=$(basename "$latest_run_dir")
+    local meta="$latest_run_dir/meta.json"
+
+    local cost_fmt turns_fmt dur_fmt status_fmt
+    if [[ -f "$meta" ]]; then
+      local cost_raw turns dur_ms status_raw
+      cost_raw=$(jq -r '.cost.actual_usd // .cost.estimated_usd // "null"' "$meta" 2>/dev/null)
+      turns=$(jq -r '.num_turns // "null"' "$meta" 2>/dev/null)
+      dur_ms=$(jq -r '.duration_ms // "null"' "$meta" 2>/dev/null)
+      status_raw=$(jq -r '.status // "null"' "$meta" 2>/dev/null)
+
+      cost_fmt=$(   [[ "$cost_raw"   == "null" ]] && echo "-" || printf '$%.4f' "$cost_raw")
+      turns_fmt=$(  [[ "$turns"      == "null" ]] && echo "-" || echo "$turns")
+      dur_fmt=$(    [[ "$dur_ms"     == "null" ]] && echo "-" || echo "$(( dur_ms / 1000 ))s")
+      status_fmt=$( [[ "$status_raw" == "null" ]] && echo "-" || echo "$status_raw")
+    else
+      cost_fmt="-"; turns_fmt="-"; dur_fmt="-"; status_fmt="-"
+    fi
+
+    printf "%-20s  %-16s  %-10s  %-10s  %-6s  %s\n" "$plant_name" "$latest_run_name" "$status_fmt" "$cost_fmt" "$turns_fmt" "$dur_fmt"
+  done
+}
+
+cmd_tend() {
+  local trigger="unspecified"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --trigger) trigger="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+
+  local gardener="gardener"
+  local plant_dir="$REPO_ROOT/plants/$gardener"
+  [[ -d "$plant_dir" ]] || die "gardener plant not found: plants/$gardener"
+
+  local goals_dir="$REPO_ROOT/goals"
+  mkdir -p "$goals_dir"
+
+  # auto-increment: find highest NNN across root goals/, root runs/, and all plant runs/
+  local max_n=0
+  for f in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md \
+            "$REPO_ROOT/runs"/[0-9][0-9][0-9]-*/; do
+    [[ -e "$f" ]] || continue
+    local nnn
+    nnn=$(basename "${f%.md}" | grep -oE '^[0-9]+' | head -1)
+    [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+  done
+  for plant_path in "$REPO_ROOT/plants"/*/; do
+    for f in "${plant_path}runs"/[0-9][0-9][0-9]-*/; do
+      [[ -d "$f" ]] || continue
+      local nnn
+      nnn=$(basename "$f" | grep -oE '^[0-9]+' | head -1)
+      [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+    done
+  done
+  local goal_num
+  goal_num=$(printf "%03d" $(( max_n + 1 )))
+  local goal_file="goals/${goal_num}-tend.md"
+  local goal_path="$goals_dir/${goal_num}-tend.md"
+
+  cat > "$goal_path" <<TEND
+---
+assigned_to: gardener
+trigger: $trigger
+---
+TEND
+  cat >> "$goal_path" <<'TEND'
+# Tend the Garden
+
+## Read state
+
+Note the trigger from frontmatter (`trigger:` field) — include it in your summary output.
+
+Run these from the personalagentkit root:
+- `./scripts/personalagentkit status` — all runs, costs, turns, duration
+- `python3 report` — cost trends and summary stats
+- `ls inbox/` — any messages waiting for reply?
+
+For each plant:
+- Read `plants/<name>/memory/MEMORY.md`
+- Read its most recent run's `meta.json`, `output.md`, `reflection.md`
+- Check for `plants/<name>/capability-gap-*.md` — named gap files identify
+  specific missing capabilities (e.g., `capability-gap-sms-receipt.md`).
+  Commission gap-closing goals as needed. Goals that `requires:` a gapped
+  capability are blocked by the dispatcher automatically; other goals for
+  that plant run normally.
+
+For root:
+- `ls runs/*/reflection.md` — any runs missing reflections?
+- Check `horizons/*.md` — open horizons with no active work?
+- Check `memory/MEMORY.md` — stale entries that have been resolved?
+
+## Decide
+
+For each plant: stuck, drifting, progressing, or ready for next challenge?
+For root: is there an infrastructure gap limiting the system?
+
+**Loop detection (required):** Read the plant's last 5 runs. If the same goal
+type has run 3+ consecutive times with no meaningful outcome change, the plant
+is looping. Commission a different type or leave it alone. Catch this yourself
+through judgment — don't rely on a mechanical counter.
+
+**Spike before build (required):** Before commissioning a `build` goal for a
+new capability, first consider whether an explorer `spike` would improve the
+implementation. Skip the spike only when the capability is well-understood.
+
+## Write (or don't)
+
+Restraint is a quality. Write a goal only when intervention is warranted.
+A plant making genuine progress should be left alone.
+
+When a genuine gap exists, write a goal file at `goals/NNN-slug.md` or use
+`./scripts/personalagentkit submit`. All goals live in root `goals/` — never in plant-specific
+directories.
+
+**Goal routing:**
+- Use `assigned_to: <plant-name>` frontmatter to route to a plant
+- Use `depends_on: [prior-slug]` to enforce ordering
+- Use `priority: N` (1=urgent, 10=someday, default 5) to control dispatch order
+- Never write a goal whose only purpose is to forward another goal — that is a
+  routing bug (you forgot to use frontmatter)
+
+**Reviewer commissioning rule:** Only write reviewer goals for `build`, `fix`,
+or `spike` type runs. Never for `integrate-reviewer-feedback` runs — reviewing
+reflections about reflections creates a closed loop that produces no value.
+
+## Produce outputs
+
+Every tend run:
+1. Print a short summary (10–20 lines) to stdout — captured as `output.md`
+2. Write `reflection.md` to the run directory — what did tending reveal?
+3. Update `memory/MEMORY.md` if this tend revealed durable insights
+
+Do NOT write to `output.md` using the Write tool.
+Do NOT make a terminal commit — the runner's auto-commit captures everything.
+TEND
+
+  echo "personalagentkit: wrote tend goal → $goal_path"
+  cmd_plant_run "$gardener" "$goal_file"
+}
+
+cmd_retrospective() {
+  local gardener="gardener"
+  local plant_dir="$REPO_ROOT/plants/$gardener"
+  [[ -d "$plant_dir" ]] || die "gardener plant not found: plants/$gardener"
+
+  # Ensure shared knowledge directory exists
+  local shared_knowledge
+  shared_knowledge="$(dirname "$REPO_ROOT")/shared/knowledge"
+  mkdir -p "$shared_knowledge"
+
+  local goals_dir="$REPO_ROOT/goals"
+  mkdir -p "$goals_dir"
+
+  # auto-increment: find highest NNN across root goals/, root runs/, and all plant runs/
+  local max_n=0
+  for f in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md \
+            "$REPO_ROOT/runs"/[0-9][0-9][0-9]-*/; do
+    [[ -e "$f" ]] || continue
+    local nnn
+    nnn=$(basename "${f%.md}" | grep -oE '^[0-9]+' | head -1)
+    [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+  done
+  for plant_path in "$REPO_ROOT/plants"/*/; do
+    for f in "${plant_path}runs"/[0-9][0-9][0-9]-*/; do
+      [[ -d "$f" ]] || continue
+      local nnn
+      nnn=$(basename "$f" | grep -oE '^[0-9]+' | head -1)
+      [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+    done
+  done
+  local goal_num
+  goal_num=$(printf "%03d" $(( max_n + 1 )))
+  local goal_file="goals/${goal_num}-retrospective.md"
+  local goal_path="$goals_dir/${goal_num}-retrospective.md"
+
+  cat > "$goal_path" <<'RETRO'
+---
+assigned_to: gardener
+---
+# Retrospective
+
+## What
+
+Synthesize patterns across recent runs. This is NOT a tend — do not write goals
+or update memory. Focus on observation, analysis, and shared knowledge.
+
+## How
+
+1. Run `./scripts/personalagentkit status` for full run history.
+2. Identify your window: find the last retrospective run (if any) and read everything since.
+3. Read ALL reflections from runs in your window — not just the latest per plant.
+   Read each plant's `memory/MEMORY.md` for context.
+4. Read existing files in `../shared/knowledge/` (if any).
+5. Analyze for:
+   - **Prediction errors / surprises** — outcomes that diverged from expectations
+   - **Patterns across runs** — recurring failure modes, successful strategies
+   - **Cost trends** — are costs rising, falling, stable? Which plants cost most?
+   - **Strategy assessment** — is the current approach working?
+   - **Stale state** — memory entries, capability gaps, or shared knowledge that are outdated
+6. Write shared knowledge: at most 1–2 new fact files to `../shared/knowledge/`.
+   Only write facts grounded in evidence from multiple runs. Format:
+   ```
+   # <fact title>
+   **Observation:** <what was observed>
+   **Evidence:** runs NNN, NNN; <brief description>
+   **Confidence:** high | medium | low
+   **Date:** YYYY-MM-DD
+   ```
+   Delete or update any stale facts already there.
+7. Print a 20–40 line synthesis to stdout structured as:
+   - **Surprises** — what was unexpected
+   - **Patterns** — what keeps happening
+   - **Strategy** — assessment of current direction
+   - **Actions** — what the next tend should consider (but do NOT write goals)
+8. Write `reflection.md` to the run directory.
+
+## Constraints
+
+- Do NOT write goals — that's what tends do
+- Do NOT update plant memory or root memory — observe only
+- Do NOT make a terminal commit — the runner's auto-commit captures everything
+- Do NOT write to `output.md` via the Write tool — print to stdout
+- Read broadly: the value of a retrospective is seeing what individual tends miss
+RETRO
+
+  # Patch the hardcoded knowledge path to match this installation
+  sed -i "s|../shared/knowledge|${shared_knowledge}|g" "$goal_path"
+
+  echo "personalagentkit: wrote retrospective goal → $goal_path"
+  cmd_plant_run "$gardener" "$goal_file"
+}
+
+cmd_regenesis() {
+  local plant_name="${1:-}"
+  [[ -n "$plant_name" ]] || die "usage: telos regenesis <plant-name> [seed-name]"
+
+  local plant_dir="$REPO_ROOT/plants/$plant_name"
+  [[ -d "$plant_dir" ]] || die "plant not found: plants/$plant_name"
+
+  local seed_name="${2:-}"
+  if [[ -z "$seed_name" ]]; then
+    local seed_file="$plant_dir/seed"
+    [[ -f "$seed_file" ]] || die "no seed file at $seed_file — pass seed name explicitly: telos regenesis $plant_name <seed-name>"
+    seed_name=$(cat "$seed_file")
+  fi
+
+  local seed_path="$REPO_ROOT/seeds/${seed_name}.md"
+  [[ -f "$seed_path" ]] || die "seed not found: seeds/${seed_name}.md"
+
+  require claude
+  require jq
+
+  local goals_dir="$REPO_ROOT/goals"
+  mkdir -p "$goals_dir"
+
+  # auto-increment: find highest NNN across root goals/, root runs/, and all plant runs/
+  local max_n=0
+  for f in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md \
+            "$REPO_ROOT/runs"/[0-9][0-9][0-9]-*/; do
+    [[ -e "$f" ]] || continue
+    local nnn
+    nnn=$(basename "${f%.md}" | grep -oE '^[0-9]+' | head -1)
+    [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+  done
+  for plant_path in "$REPO_ROOT/plants"/*/; do
+    for f in "${plant_path}runs"/[0-9][0-9][0-9]-*/; do
+      [[ -d "$f" ]] || continue
+      local nnn
+      nnn=$(basename "$f" | grep -oE '^[0-9]+' | head -1)
+      [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+    done
+  done
+  local goal_num
+  goal_num=$(printf "%03d" $(( max_n + 1 )))
+  local goal_file="goals/${goal_num}-regenesis.md"
+  local goal_path="$goals_dir/${goal_num}-regenesis.md"
+
+  local seed_content
+  seed_content=$(cat "$seed_path")
+
+  cat > "$goal_path" <<REGENESIS
+---
+assigned_to: $plant_name
+---
+# Re-genesis
+
+Your seed has been updated. Integrate the changes into your memory without
+losing your accumulated knowledge or identity.
+- Do NOT make a terminal commit — the runner's auto-commit captures everything
+- Do NOT write to \`output.md\` via the Write tool
+
+## Current seed content
+
+\`\`\`
+$seed_content
+\`\`\`
+REGENESIS
+
+  echo "telos: wrote regenesis goal → $goal_path"
+  cmd_plant_run "$plant_name" "$goal_file"
+}
+
+cmd_cycle() {
+  local workers=2 tend_interval=300 max_cost="" retro_interval=14400 fg=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workers)        workers="$2";        shift 2 ;;
+      --tend-interval)  tend_interval="$2";  shift 2 ;;
+      --max-cost)       max_cost="$2";       shift 2 ;;
+      --retro-interval) retro_interval="$2"; shift 2 ;;
+      --fg)             fg=true;             shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  local script="$REPO_ROOT/scripts/dispatch.py"
+  [[ -f "$script" ]] || die "dispatch.py not found: $script"
+  local args=(--workers "$workers" --tend-interval "$tend_interval" --retro-interval "$retro_interval")
+  [[ -n "$max_cost" ]] && args+=(--max-cost "$max_cost")
+
+  # Clear sentinels from any previous stop/pause
+  rm -f "$REPO_ROOT/.telos-pause" "$REPO_ROOT/.telos-stop"
+
+  # Save params so restart can reuse them
+  local params_file="$REPO_ROOT/.telos-cycle-params"
+  {
+    echo "workers=$workers"
+    echo "tend_interval=$tend_interval"
+    echo "retro_interval=$retro_interval"
+    echo "max_cost=$max_cost"
+  } > "$params_file"
+
+  # Clear stale pyc cache
+  rm -f "$REPO_ROOT/scripts/__pycache__/dispatch."*.pyc 2>/dev/null
+
+  # Auto-launch in tmux unless --fg, already in tmux, or tmux unavailable
+  local garden_name
+  garden_name=$(basename "$REPO_ROOT")
+  local session="telos-${garden_name}"
+
+  if [[ "$fg" == "false" ]] && [[ -z "${TMUX:-}" ]] && command -v tmux &>/dev/null; then
+    # Build the full command to run inside tmux
+    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/telos") cycle --fg"
+    cmd+=" --workers $workers --tend-interval $tend_interval --retro-interval $retro_interval"
+    [[ -n "$max_cost" ]] && cmd+=" --max-cost $max_cost"
+
+    # Kill existing session if present (stale from previous run)
+    tmux kill-session -t "$session" 2>/dev/null || true
+    tmux new-session -d -s "$session" "$cmd"
+    echo "telos: cycle running in tmux session '$session'"
+    echo "telos: attach with: tmux attach -t $session"
+    echo "telos: stop with:   ./scripts/telos stop"
+    return 0
+  fi
+
+  exec python3 "$script" --repo-root "$REPO_ROOT" "${args[@]}"
+}
+
+cmd_restart() {
+  local params_file="$REPO_ROOT/.telos-cycle-params"
+  [[ -f "$params_file" ]] || die "no previous cycle params found — run 'telos cycle' first"
+
+  # Load saved params
+  local workers=2 tend_interval=300 retro_interval=14400 max_cost=""
+  while IFS='=' read -r key val; do
+    case "$key" in
+      workers)        workers="$val" ;;
+      tend_interval)  tend_interval="$val" ;;
+      retro_interval) retro_interval="$val" ;;
+      max_cost)       max_cost="$val" ;;
+    esac
+  done < "$params_file"
+
+  local garden_name
+  garden_name=$(basename "$REPO_ROOT")
+  local session="telos-${garden_name}"
+
+  # Signal stop — dispatcher will finish in-flight goals then exit
+  echo "telos: signaling stop..."
+  touch "$REPO_ROOT/.telos-stop"
+
+  # Wait for the dispatch.py process to exit (however long it takes)
+  if command -v tmux &>/dev/null && tmux has-session -t "$session" 2>/dev/null; then
+    echo "telos: waiting for dispatcher to finish in-flight goals..."
+    # Find the dispatch.py pid inside the tmux pane and wait for it
+    local dispatch_pid
+    dispatch_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
+    if [[ -n "$dispatch_pid" ]]; then
+      # The tmux pane runs bash, which runs python3 dispatch.py — find the python child
+      local py_pid
+      py_pid=$(pgrep -P "$dispatch_pid" -f 'dispatch.py' 2>/dev/null || true)
+      if [[ -n "$py_pid" ]]; then
+        # Wait for the python process to exit naturally
+        while kill -0 "$py_pid" 2>/dev/null; do
+          sleep 2
+        done
+      else
+        # Can't find python pid — fall back to waiting for pane to go dead
+        while tmux list-panes -t "$session" -F '#{pane_dead}' 2>/dev/null | grep -q '^0$'; do
+          sleep 2
+        done
+      fi
+    fi
+
+    # Reuse the tmux session — send the new cycle command into it
+    local cmd="cd $(printf '%q' "$REPO_ROOT") && $(printf '%q' "$REPO_ROOT/scripts/telos") cycle --fg"
+    cmd+=" --workers $workers --tend-interval $tend_interval --retro-interval $retro_interval"
+    [[ -n "$max_cost" ]] && cmd+=" --max-cost $max_cost"
+
+    tmux respawn-pane -k -t "$session" "$cmd"
+    echo "telos: restarted in tmux session '$session'"
+    echo "telos: attach with: tmux attach -t $session"
+  else
+    # No tmux session — just start a new cycle
+    echo "telos: restarting cycle..."
+    local cycle_args=(--workers "$workers" --tend-interval "$tend_interval" --retro-interval "$retro_interval")
+    [[ -n "$max_cost" ]] && cycle_args+=(--max-cost "$max_cost")
+    cmd_cycle "${cycle_args[@]}"
+  fi
+}
+
+cmd_cycle_legacy() {
+  local max_iter=5
+  local max_cost=""
+  local tend_every=4
+
+  # parse flags and positional args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --max-cost)
+        [[ -n "${2:-}" ]] || die "--max-cost requires a value"
+        max_cost="$2"
+        shift 2
+        ;;
+      --tend-every)
+        [[ -n "${2:-}" ]] || die "--tend-every requires a value"
+        tend_every="$2"
+        shift 2
+        ;;
+      --*)
+        die "unknown flag: $1"
+        ;;
+      *)
+        max_iter="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local iter=0
+  local cycle_cost=0
+  local consecutive_type_count=0
+  local last_goal_type=""
+
+  local cost_msg=""
+  [[ -n "$max_cost" ]] && cost_msg=", max_cost=\$$max_cost"
+  echo "telos: cycle starting (max_iterations=$max_iter, tend_every=$tend_every$cost_msg)"
+
+  # surface any pending inbox messages before the cycle begins
+  if [[ -d "$REPO_ROOT/inbox" ]]; then
+    local any_pending=false
+    for msg in "$REPO_ROOT/inbox"/*-to-operator.md; do
+      [[ -f "$msg" ]] || continue
+      local base nnn reply
+      base=$(basename "$msg" .md)
+      nnn=$(echo "$base" | grep -oE '^[0-9]+' | head -1)
+      reply="$REPO_ROOT/inbox/${nnn}-reply.md"
+      if [[ ! -f "$reply" ]]; then
+        if [[ "$any_pending" == "false" ]]; then
+          echo "telos: ── inbox ────────────────────────────────────────────────"
+          any_pending=true
+        fi
+        echo "telos: pending: $msg"
+        echo "---"
+        cat "$msg"
+        echo "---"
+      fi
+    done
+    [[ "$any_pending" == "true" ]] && echo "telos: ────────────────────────────────────────────────────────"
+  fi
+
+  while true; do
+    # step 1: tend (gardener assesses, may write new goals) — only when due
+    local tended_this_iter=false
+    if (( iter % tend_every == 0 )); then
+      echo "telos: cycle [$iter] tending garden..."
+      "$REPO_ROOT/scripts/telos" tend
+      tended_this_iter=true
+    fi
+
+    # step 2: scan root goals/ for pending goals
+    # pending = goal file NNN-*.md exists but no run dir (in root or any plant) with matching NNN prefix
+    local best_nnn=999999
+    local best_source=""   # "root" or plant name (from assigned_to)
+    local best_goal_rel=""
+    local blocked_count=0
+
+    for goal_file in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md; do
+      [[ -f "$goal_file" ]] || continue
+      local base nnn nnn_int
+      base=$(basename "$goal_file" .md)
+      nnn=$(echo "$base" | grep -oE '^[0-9]+' | head -1)
+      [[ -n "$nnn" ]] || continue
+      nnn_int=$((10#$nnn))
+
+      # Check if already run: look in root runs/ AND all plant runs/
+      local has_run=false
+      local d
+      for d in "$REPO_ROOT/runs/${nnn}"-*/; do
+        [[ -d "$d" ]] && { has_run=true; break; }
+      done
+      if [[ "$has_run" == "false" ]]; then
+        local pp
+        for pp in "$REPO_ROOT/plants"/*/; do
+          [[ -d "$pp" ]] || continue
+          for d in "${pp}runs/${nnn}"-*/; do
+            [[ -d "$d" ]] && { has_run=true; break 2; }
+          done
+        done
+      fi
+      [[ "$has_run" == "true" ]] && continue
+
+      # Read frontmatter: assigned_to and depends_on
+      local goal_assigned_to goal_depends_on
+      goal_assigned_to=$(parse_goal_meta "$goal_file" assigned_to)
+      goal_depends_on=$(parse_goal_meta "$goal_file" depends_on)
+
+      # Check dependencies: skip (but count as pending-blocked) if any dep is unsatisfied
+      if [[ -n "$goal_depends_on" ]]; then
+        local deps_ok=true
+        local dep
+        while IFS= read -r dep; do
+          dep=$(echo "$dep" | tr -d ' ')
+          [[ -z "$dep" ]] && continue
+          if ! is_dep_satisfied "$dep"; then
+            deps_ok=false
+            break
+          fi
+        done < <(echo "$goal_depends_on" | tr -d '[]' | tr ',' '\n')
+        if [[ "$deps_ok" == "false" ]]; then
+          blocked_count=$(( blocked_count + 1 ))
+          continue
+        fi
+      fi
+
+      # Check capability gap for the assigned plant (if any)
+      if [[ -n "$goal_assigned_to" ]]; then
+        if [[ -f "$REPO_ROOT/plants/${goal_assigned_to}/capability-gap.md" ]]; then
+          echo "telos: cycle skipping $base — ${goal_assigned_to} has capability gap (see plants/${goal_assigned_to}/capability-gap.md)"
+          continue
+        fi
+        # Verify assigned plant exists
+        if [[ ! -d "$REPO_ROOT/plants/${goal_assigned_to}" ]]; then
+          echo "telos: auto-scaffolding plant: $goal_assigned_to (for goal $base)"
+          mkdir -p "$REPO_ROOT/plants/${goal_assigned_to}/goals" \
+                   "$REPO_ROOT/plants/${goal_assigned_to}/runs" \
+                   "$REPO_ROOT/plants/${goal_assigned_to}/memory"
+          cp "$REPO_ROOT/MOTIVATION.md" "$REPO_ROOT/plants/${goal_assigned_to}/MOTIVATION.md"
+        fi
+      fi
+
+      if (( nnn_int < best_nnn )); then
+        best_nnn=$nnn_int
+        best_source="${goal_assigned_to:-root}"
+        best_goal_rel="goals/$base.md"
+      fi
+    done
+
+    # step 3: if no runnable pending goals, stop (with tend fallback if we skipped tend this iter)
+    if [[ -z "$best_source" ]]; then
+      if (( blocked_count > 0 )); then
+        echo "telos: cycle stalled — $blocked_count goal(s) pending but blocked by unmet dependencies"
+        break
+      fi
+      if [[ "$tended_this_iter" == "false" ]]; then
+        echo "telos: cycle [$iter] queue empty — tending now to check for new goals..."
+        "$REPO_ROOT/scripts/telos" tend
+        tended_this_iter=true
+        # re-scan after fallback tend
+        best_nnn=999999
+        best_source=""
+        best_goal_rel=""
+        blocked_count=0
+        for goal_file in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md; do
+          [[ -f "$goal_file" ]] || continue
+          local base nnn nnn_int
+          base=$(basename "$goal_file" .md)
+          nnn=$(echo "$base" | grep -oE '^[0-9]+' | head -1)
+          [[ -n "$nnn" ]] || continue
+          nnn_int=$((10#$nnn))
+          local has_run=false
+          local d
+          for d in "$REPO_ROOT/runs/${nnn}"-*/; do
+            [[ -d "$d" ]] && { has_run=true; break; }
+          done
+          if [[ "$has_run" == "false" ]]; then
+            local pp
+            for pp in "$REPO_ROOT/plants"/*/; do
+              [[ -d "$pp" ]] || continue
+              for d in "${pp}runs/${nnn}"-*/; do
+                [[ -d "$d" ]] && { has_run=true; break 2; }
+              done
+            done
+          fi
+          [[ "$has_run" == "true" ]] && continue
+          local goal_assigned_to goal_depends_on
+          goal_assigned_to=$(parse_goal_meta "$goal_file" assigned_to)
+          goal_depends_on=$(parse_goal_meta "$goal_file" depends_on)
+          if [[ -n "$goal_depends_on" ]]; then
+            local deps_ok=true
+            local dep
+            while IFS= read -r dep; do
+              dep=$(echo "$dep" | tr -d ' ')
+              [[ -z "$dep" ]] && continue
+              if ! is_dep_satisfied "$dep"; then
+                deps_ok=false
+                break
+              fi
+            done < <(echo "$goal_depends_on" | tr -d '[]' | tr ',' '\n')
+            if [[ "$deps_ok" == "false" ]]; then
+              blocked_count=$(( blocked_count + 1 ))
+              continue
+            fi
+          fi
+          if [[ -n "$goal_assigned_to" ]]; then
+            if [[ -f "$REPO_ROOT/plants/${goal_assigned_to}/capability-gap.md" ]]; then
+              continue
+            fi
+            if [[ ! -d "$REPO_ROOT/plants/${goal_assigned_to}" ]]; then
+              continue
+            fi
+          fi
+          if (( nnn_int < best_nnn )); then
+            best_nnn=$nnn_int
+            best_source="${goal_assigned_to:-root}"
+            best_goal_rel="goals/$base.md"
+          fi
+        done
+      fi
+      if [[ -z "$best_source" ]]; then
+        echo "telos: cycle complete — garden is quiet after $iter goal(s) run"
+        break
+      fi
+    fi
+
+    # step 4: check iteration cap
+    if (( iter >= max_iter )); then
+      echo "telos: cycle cap reached ($iter/$max_iter), pending goals remain — run ./telos cycle again to continue"
+      break
+    fi
+
+    # step 5: classify goal type and check for repetition loop
+    local goal_slug goal_type
+    goal_slug=$(basename "$best_goal_rel" .md)
+    case "$goal_slug" in
+      *integrate-*)                                        goal_type="integrate" ;;
+      *retrospective*)                                     goal_type="retrospective" ;;
+      *tend*)                                              goal_type="tend" ;;
+      *genesis*)                                           goal_type="genesis" ;;
+      *dispatch-*)                                         goal_type="dispatch" ;;
+      *review-*)                                           goal_type="review" ;;
+      *spike-*|*-spike)                                    goal_type="spike" ;;
+      *fix-*|*fix_*)                                       goal_type="fix" ;;
+      *)                                                   goal_type="build" ;;
+    esac
+
+    if [[ "$goal_type" == "$last_goal_type" ]]; then
+      consecutive_type_count=$(( consecutive_type_count + 1 ))
+    else
+      consecutive_type_count=1
+      last_goal_type="$goal_type"
+    fi
+
+    if (( consecutive_type_count >= 6 )) && [[ "$goal_type" != "tend" && "$goal_type" != "retrospective" ]]; then
+      echo "telos: cycle loop detected — $consecutive_type_count consecutive '$goal_type' goals"
+      echo "telos: stopping to prevent spin. Commission a different goal type to continue."
+      break
+    fi
+
+    # step 6: run the best pending goal — route based on assigned_to
+    echo "telos: cycle [$iter/$max_iter] → $best_source/$best_goal_rel ($goal_type)"
+    if [[ "$best_source" == "root" ]]; then
+      "$REPO_ROOT/scripts/telos" run "$best_goal_rel"
+    else
+      "$REPO_ROOT/scripts/telos" plant-run "$best_source" "$best_goal_rel"
+    fi
+
+    # step 7: check cost cap
+    if [[ -n "$max_cost" ]]; then
+      local run_goal_id run_meta run_cost
+      run_goal_id=$(basename "$best_goal_rel" .md)
+      if [[ "$best_source" == "root" ]]; then
+        run_meta="$REPO_ROOT/runs/$run_goal_id/meta.json"
+      else
+        run_meta="$REPO_ROOT/plants/$best_source/runs/$run_goal_id/meta.json"
+      fi
+      run_cost=$(jq -r '.cost.actual_usd // 0' "$run_meta" 2>/dev/null || echo 0)
+      cycle_cost=$(echo "$cycle_cost + $run_cost" | bc)
+      if (( $(echo "$cycle_cost >= $max_cost" | bc) )); then
+        local actual_fmt max_fmt
+        actual_fmt=$(printf '%.2f' "$cycle_cost")
+        max_fmt=$(printf '%.2f' "$max_cost")
+        echo "telos: cycle cost cap reached (\$$actual_fmt / \$$max_fmt), pending goals remain — run ./telos cycle again to continue"
+        break
+      fi
+    fi
+
+    # step 8: increment and loop
+    iter=$(( iter + 1 ))
+  done
+
+  # ── post-cycle: schedule a retrospective ────────────────────────────────────
+  # Find the next available NNN across goals/ and runs/
+  local max_nnn=0
+  for f in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md \
+            "$REPO_ROOT/runs"/[0-9][0-9][0-9]-*/; do
+    [[ -e "$f" ]] || continue
+    local bn nnn
+    bn=$(basename "$f" .md)
+    nnn=$(echo "$bn" | grep -oE '^[0-9]+' | head -1)
+    [[ -n "$nnn" ]] && (( 10#$nnn > max_nnn )) && max_nnn=$((10#$nnn))
+  done
+  local next_nnn
+  next_nnn=$(printf '%03d' $(( max_nnn + 1 )))
+  local retro_file="$REPO_ROOT/goals/${next_nnn}-retrospective.md"
+
+  cat > "$retro_file" <<'RETRO'
+# Goal: Retrospective
+
+## What
+
+Write a retrospective on what happened since the last retrospective. Assess the current
+state of the garden, write a report, and convert your top recommendations into concrete
+goal stubs that the next cycle can execute.
+
+## How
+
+1. Read `memory/MEMORY.md` and the most recent retrospective file under `memory/`
+   for context on prior state.
+2. Run `./telos garden` and `./telos status` to see what ran.
+3. Read recent run outputs and reflections across all plants. Look especially for:
+   - Loops: same goal type repeating more than 3 times in a row
+   - Idle plants: plants with no recent goals despite having unresolved threads
+   - Needs-human signals: `needs-human.md` files in any plant's latest run directory
+4. Write a new dated section to `memory/retrospective.md` covering:
+   - What was accomplished
+   - Patterns or problems observed (be honest — name loops directly)
+   - 3 concrete recommendations for the next cycle
+5. For each recommendation, write a draft goal stub:
+   - Find the next available NNN by scanning `goals/` and `runs/`
+   - Write `goals/NNN-<slug>.md` with a brief goal description
+   - These become real goals the cycle will pick up and run
+6. Print a short summary to stdout (becomes output.md). Include which goal stubs were written.
+
+## Definition of done
+
+- `memory/retrospective.md` updated with a dated section
+- Up to 3 goal stubs written to `goals/NNN-*.md`
+- stdout summary printed
+
+## Constraints
+
+- Goal stubs must be actionable (not "improve quality" — name the specific file and change)
+- If a recommendation requires human input, write the stub anyway and note it in the goal
+- Don't write a stub for "do another retrospective" — that happens automatically
+- **Do NOT make a terminal commit** with a message like `run {id}: finalize`. The runner
+  commits everything after you exit. Use descriptive intermediate commits only.
+- **Do NOT write to `output.md` via the Write tool.** Print your summary to stdout.
+RETRO
+
+  echo "telos: running post-cycle retrospective → $retro_file"
+  "$REPO_ROOT/scripts/telos" run "goals/${next_nnn}-retrospective.md"
+}
+
+cmd_submit() {
+  local plant_name="" depends_on="" submitted_by="${TELOS_SUBMITTED_BY:-}" priority="" goal_file=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --plant)        plant_name="$2";    shift 2 ;;
+      --depends-on)   depends_on="$2";    shift 2 ;;
+      --submitted-by) submitted_by="$2";  shift 2 ;;
+      --priority)     priority="$2";      shift 2 ;;
+      *)              goal_file="$1";     shift ;;
+    esac
+  done
+
+  [[ -n "$goal_file" ]] || die "usage: telos submit [--plant <name>] [--depends-on <slug,...>] <goal-file>"
+  [[ -f "$goal_file" ]] || die "goal file not found: $goal_file"
+
+  if [[ -n "$plant_name" ]]; then
+    [[ -d "$REPO_ROOT/plants/$plant_name" ]] || die "plant not found: plants/$plant_name"
+  fi
+
+  # Auto-increment NNN across root goals/, root runs/, and all plant runs/
+  local max_n=0
+  local f nnn
+  for f in "$REPO_ROOT/goals"/[0-9][0-9][0-9]-*.md \
+            "$REPO_ROOT/runs"/[0-9][0-9][0-9]-*/; do
+    [[ -e "$f" ]] || continue
+    nnn=$(basename "${f%.md}" | grep -oE '^[0-9]+' | head -1)
+    [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+  done
+  local plant_path
+  for plant_path in "$REPO_ROOT/plants"/*/; do
+    for f in "${plant_path}runs"/[0-9][0-9][0-9]-*/; do
+      [[ -d "$f" ]] || continue
+      nnn=$(basename "$f" | grep -oE '^[0-9]+' | head -1)
+      [[ -n "$nnn" ]] && (( 10#$nnn > max_n )) && max_n=$((10#$nnn))
+    done
+  done
+  local goal_num
+  goal_num=$(printf "%03d" $(( max_n + 1 )))
+
+  # Derive slug from source filename (strip leading NNN- prefix if present)
+  local goal_slug
+  goal_slug=$(basename "$goal_file" .md | sed 's/^[0-9]*-//')
+  local dest="$REPO_ROOT/goals/${goal_num}-${goal_slug}.md"
+
+  # Extract body and existing frontmatter from source file
+  local body first_line src_assigned="" src_depends="" src_submitted="" src_priority=""
+  first_line=$(head -1 "$goal_file")
+  if [[ "$first_line" == "---" ]]; then
+    # Parse existing frontmatter values
+    local fm_block
+    fm_block=$(awk '/^---$/{n++; if(n==2) exit} n==1{print}' "$goal_file")
+    src_assigned=$(echo "$fm_block"  | grep '^assigned_to:'  | head -1 | cut -d: -f2- | xargs || true)
+    src_depends=$(echo "$fm_block"   | grep '^depends_on:'   | head -1 | cut -d: -f2- | xargs || true)
+    src_submitted=$(echo "$fm_block" | grep '^submitted_by:' | head -1 | cut -d: -f2- | xargs || true)
+    src_priority=$(echo "$fm_block"  | grep '^priority:'     | head -1 | cut -d: -f2- | xargs || true)
+    body=$(awk 'BEGIN{f=0} /^---$/{f++; if(f==2){found=1; next}} found{print}' "$goal_file")
+  else
+    body=$(cat "$goal_file")
+  fi
+
+  # CLI flags override source frontmatter
+  [[ -n "$plant_name" ]]   && src_assigned="$plant_name"
+  [[ -n "$depends_on" ]]   && src_depends="[$depends_on]"
+  [[ -n "$submitted_by" ]] && src_submitted="$submitted_by"
+  [[ -n "$priority" ]]     && src_priority="$priority"
+
+  # Normalize depends_on format
+  [[ -n "$src_depends" ]] && src_depends=$(echo "$src_depends" | sed 's/^\[//;s/\]$//')
+
+  # Write destination file with merged frontmatter
+  {
+    if [[ -n "$src_assigned" || -n "$src_depends" || -n "$src_submitted" || -n "$src_priority" ]]; then
+      echo "---"
+      [[ -n "$src_assigned" ]]  && echo "assigned_to: $src_assigned"
+      [[ -n "$src_depends" ]]   && echo "depends_on: [$src_depends]"
+      [[ -n "$src_submitted" ]] && echo "submitted_by: $src_submitted"
+      [[ -n "$src_priority" ]]  && echo "priority: $src_priority"
+      echo "---"
+    fi
+    echo "$body"
+  } > "$dest"
+
+  (
+    flock -x 200
+    git -C "$REPO_ROOT" add "$dest" 2>/dev/null
+    git -C "$REPO_ROOT" commit -m "goal: ${goal_num}-${goal_slug}" 2>/dev/null || true
+  ) 200>"$REPO_ROOT/.telos-git.lock"
+
+  echo "submitted: goals/${goal_num}-${goal_slug}.md"
+}
+
+cmd_await() {
+  local goal_id="" timeout=300
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout) timeout="$2"; shift 2 ;;
+      *)         goal_id="$1"; shift ;;
+    esac
+  done
+
+  [[ -n "$goal_id" ]] || die "usage: telos await <goal-id> [--timeout <seconds>]"
+
+  local elapsed=0
+  echo "telos: await $goal_id (timeout=${timeout}s)"
+
+  while (( elapsed < timeout )); do
+    local meta=""
+    # Check root runs
+    local run_dir
+    for run_dir in "$REPO_ROOT/runs/${goal_id}"*/; do
+      [[ -f "${run_dir}meta.json" ]] && { meta="${run_dir}meta.json"; break; }
+    done
+    # Check plant runs if not found in root
+    if [[ -z "$meta" ]]; then
+      local plant_path
+      for plant_path in "$REPO_ROOT/plants"/*/; do
+        for run_dir in "${plant_path}runs/${goal_id}"*/; do
+          [[ -f "${run_dir}meta.json" ]] && { meta="${run_dir}meta.json"; break 2; }
+        done
+      done
+    fi
+
+    if [[ -n "$meta" ]]; then
+      local status
+      status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+      if [[ "$status" == "success" ]]; then
+        echo "telos: await $goal_id → success"
+        return 0
+      elif [[ "$status" == "failure" || "$status" == "killed" ]]; then
+        echo "telos: await $goal_id → $status"
+        return 1
+      fi
+    fi
+
+    sleep 10
+    elapsed=$(( elapsed + 10 ))
+  done
+
+  echo "telos: await $goal_id → timeout after ${timeout}s"
+  return 2
+}
+
+cmd_watch() {
+  trap 'printf "\ntelos: done\n"; exit 0' INT TERM
+
+  while true; do
+    printf '\033[2J\033[H'
+    printf 'telos: watching... (ctrl-c to stop)\n\n'
+
+    local now_epoch
+    now_epoch=$(date +%s)
+    local found=false
+
+    # Collect all running runs from root + all plants
+    local meta
+    for meta in \
+        "$REPO_ROOT/runs"/*/meta.json \
+        "$REPO_ROOT/plants"/*/runs/*/meta.json; do
+      [[ -f "$meta" ]] || continue
+      local status_raw
+      status_raw=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+      [[ "$status_raw" == "running" ]] || continue
+      found=true
+
+      local run_id started_at
+      run_id=$(jq -r '.run_id // ""' "$meta" 2>/dev/null)
+      started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+
+      local started_epoch elapsed em es
+      started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" "+%s" 2>/dev/null || echo 0)
+      elapsed=$(( now_epoch - started_epoch ))
+      em=$(( elapsed / 60 ))
+      es=$(( elapsed % 60 ))
+
+      local events_file event_count
+      events_file="$(dirname "$meta")/events.jsonl"
+      event_count=0
+      [[ -f "$events_file" ]] && event_count=$(wc -l < "$events_file" 2>/dev/null | tr -d ' ' || echo 0)
+
+      # Build display id: plant/run-id or run-id
+      local display_id
+      if [[ "$meta" == *"/plants/"* ]]; then
+        local plant_name
+        plant_name=$(echo "$meta" | sed 's|.*/plants/\([^/]*\)/.*|\1|')
+        display_id="${plant_name}/${run_id}"
+      else
+        display_id="$run_id"
+      fi
+
+      printf '  %-40s  %dm %02ds   %s events\n' "$display_id" "$em" "$es" "$event_count"
+    done
+
+    if [[ "$found" == "false" ]]; then
+      printf '  (no running goals)\n'
+    fi
+
+    sleep 3
+  done
+}
+
+cmd_priority() {
+  local goal_id="${1:-}" priority="${2:-}"
+  [[ -n "$goal_id" && -n "$priority" ]] || die "usage: telos priority <goal-id> <N>"
+  local goal_file
+  goal_file=$(ls "$REPO_ROOT/goals/${goal_id}"*.md 2>/dev/null | head -1)
+  [[ -n "$goal_file" && -f "$goal_file" ]] || die "goal not found: $goal_id"
+  python3 - "$goal_file" "$priority" <<'PYEOF'
+import sys, re
+path, priority = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    content = f.read()
+if content.startswith('---'):
+    # frontmatter exists — update or insert priority
+    parts = content.split('---', 2)
+    fm = parts[1]
+    if re.search(r'^priority:', fm, re.MULTILINE):
+        fm = re.sub(r'^priority:.*$', f'priority: {priority}', fm, flags=re.MULTILINE)
+    else:
+        fm = fm.rstrip('\n') + f'\npriority: {priority}\n'
+    content = '---' + fm + '---' + parts[2]
+else:
+    content = f'---\npriority: {priority}\n---\n' + content
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+  (
+    flock -x 200
+    git -C "$REPO_ROOT" add "$goal_file" 2>/dev/null
+    git -C "$REPO_ROOT" commit -m "priority: $goal_id → $priority" 2>/dev/null || true
+  ) 200>"$REPO_ROOT/.telos-git.lock"
+  echo "telos: priority set → $goal_file (priority: $priority)"
+}
+
+cmd_cancel() {
+  local goal_id="${1:-}"
+  [[ -n "$goal_id" ]] || die "usage: telos cancel <goal-id>"
+  local goal_file
+  goal_file=$(ls "$REPO_ROOT/goals/${goal_id}"*.md 2>/dev/null | head -1)
+  [[ -n "$goal_file" && -f "$goal_file" ]] || die "goal not found: $goal_id"
+  local cancelled="${goal_file%.md}.cancelled"
+  mv "$goal_file" "$cancelled"
+  (
+    flock -x 200
+    git -C "$REPO_ROOT" rm "$goal_file" 2>/dev/null || true
+    git -C "$REPO_ROOT" add "$cancelled" 2>/dev/null
+    git -C "$REPO_ROOT" commit -m "cancel: $goal_id" 2>/dev/null || true
+  ) 200>"$REPO_ROOT/.telos-git.lock"
+  echo "telos: cancelled → $cancelled"
+}
+
+cmd_pause() {
+  touch "$REPO_ROOT/.telos-pause"
+  echo "telos: pause sentinel set (.telos-pause)"
+}
+
+cmd_stop() {
+  touch "$REPO_ROOT/.telos-stop"
+  echo "telos: stop sentinel set (.telos-stop)"
+}
+
+cmd_resume() {
+  rm -f "$REPO_ROOT/.telos-pause" "$REPO_ROOT/.telos-stop"
+  echo "telos: sentinels cleared"
+}
+
+cmd_help() {
+  cat <<'HELP'
+telos — minimal goal runner
+
+Commands:
+  run <goal-file>            Run a goal, record what happened
+  status                     Show in-flight runs at top, then all root run records
+  watch                      Live-updating table of in-flight runs (ctrl-c to stop)
+  plant <seed> <name>        Create a new plant from a seed and run its genesis goal
+  plant-run <name> <goal>    Run a subsequent goal within a plant (injects plant memory)
+  garden                     Show the state of all plants
+  tend                       Write a tend goal for head-gardener and run it
+  retrospective              Write a retrospective goal for gardener and run it
+  regenesis <plant> [seed]   Re-inject updated seed into a plant's memory
+  submit [--plant <name>] [--depends-on <slug,...>] [--priority N] <goal-file>
+                             Write a goal to goals/ with frontmatter; exits immediately
+  await <goal-id> [--timeout <seconds>]
+                             Poll until a goal run reaches success, failure, or killed (default: 300s)
+  cycle [--workers N] [--tend-interval SECONDS] [--retro-interval SECONDS] [--max-cost <dollars>] [--fg]
+                             Concurrent dispatcher: auto-launches in tmux (use --fg to stay in foreground)
+  priority <goal-id> <N>     Set priority (lower = sooner; default 5)
+  cancel <goal-id>           Remove goal from queue (renames to .cancelled)
+  pause                      Signal dispatcher to pause after current batch
+  stop                       Signal dispatcher to exit after current goals finish
+  restart                    Stop cleanly, then restart cycle with same parameters
+  resume                     Clear pause/stop sentinels
+  help                       Show this message
+
+Run records (runs/NNN-slug/):
+  meta.json       Structured run record; status is one of: running | success | failure | killed
+  events.jsonl    NDJSON stream of claude events (tail -f while running for live view)
+  output.md       Final agent text output extracted from the result event
+  stderr.txt      stderr from the claude process
+
+  status: killed  Set when the 60-second no-event watchdog fires; partial cost data preserved
+
+Goal frontmatter (optional YAML block at top of goal file):
+  ---
+  assigned_to: first-coder    # route to a plant (must match plants/<name>)
+  depends_on: [003-build-x]   # wait until these goal slugs have a successful run
+  priority: 5                 # 1=urgent, 10=someday, default 5 (lower runs sooner)
+  ---
+
+Examples:
+  ./telos run goals/002-something.md
+  ./telos status
+  ./telos watch
+  ./telos plant coder first-coder
+  ./telos plant-run first-coder goals/002-next.md
+  ./telos garden
+  ./telos tend
+  ./telos submit --plant first-coder /tmp/my-goal.md
+  ./telos submit --plant explorer --depends-on 012-build-lib --priority 3 /tmp/spike.md
+  ./telos await 013-my-goal
+  ./telos await 013-my-goal --timeout 600
+  ./telos cycle
+  ./telos cycle --workers 3 --tend-interval 120
+  ./telos cycle --workers 2 --max-cost 5.00
+  ./telos priority 007-fix-bug 2
+  ./telos cancel 007-fix-bug
+  ./telos pause
+  ./telos stop
+  ./telos resume
+HELP
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  run)        shift; cmd_run "$@" ;;
+  status)     cmd_status ;;
+  watch)      cmd_watch ;;
+  plant)      shift; cmd_plant "$@" ;;
+  plant-run)  shift; cmd_plant_run "$@" ;;
+  garden)     cmd_garden ;;
+  tend)       cmd_tend ;;
+  retrospective) cmd_retrospective ;;
+  regenesis)  shift; cmd_regenesis "$@" ;;
+  submit)     shift; cmd_submit "$@" ;;
+  await)      shift; cmd_await "$@" ;;
+  cycle)      shift; cmd_cycle "$@" ;;
+  priority)   shift; cmd_priority "$@" ;;
+  cancel)     shift; cmd_cancel "$@" ;;
+  pause)      cmd_pause ;;
+  stop)       cmd_stop ;;
+  restart)    cmd_restart ;;
+  resume)     cmd_resume ;;
+  help)       cmd_help ;;
+  *)          die "unknown command: $1 (try: telos help)" ;;
+esac

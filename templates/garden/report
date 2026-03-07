@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Telos run report — reads all runs/*/meta.json and summarizes them."""
+
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Matches the stale threshold in ./telos status (telos line 272: elapsed > 7200)
+STALE_THRESHOLD_SECS = 7200
+
+TELOS_ROOT = Path(__file__).parent
+RUNS_DIR = TELOS_ROOT / "runs"
+PLANTS_DIR = TELOS_ROOT / "plants"
+
+
+def get_cost(meta):
+    cost = meta.get("cost")
+    if not cost or not isinstance(cost, dict):
+        return None
+    return cost.get("actual_usd") or cost.get("estimated_usd")
+
+
+def fmt_cost(val):
+    if val is None:
+        return "—"
+    return f"${val:.4f}"
+
+
+def fmt_duration(ms):
+    if ms is None:
+        return "—"
+    s = int(ms / 1000)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60:02d}s"
+
+
+def fmt_turns(n):
+    return "—" if n is None else str(n)
+
+
+def load_runs():
+    runs = []
+    for run_dir in sorted(RUNS_DIR.iterdir()):
+        meta_file = run_dir / "meta.json"
+        if meta_file.exists():
+            try:
+                with open(meta_file) as f:
+                    runs.append(json.load(f))
+            except (json.JSONDecodeError, OSError):
+                pass
+    return runs
+
+
+def load_plant_runs():
+    """Returns dict of plant_name -> [meta, ...] sorted by run_id."""
+    plants = {}
+    if not PLANTS_DIR.exists():
+        return plants
+    for plant_dir in sorted(PLANTS_DIR.iterdir()):
+        runs_dir = plant_dir / "runs"
+        if not runs_dir.is_dir():
+            continue
+        runs = []
+        for run_dir in sorted(runs_dir.iterdir()):
+            meta_file = run_dir / "meta.json"
+            if meta_file.exists():
+                try:
+                    with open(meta_file) as f:
+                        runs.append(json.load(f))
+                except (json.JSONDecodeError, OSError):
+                    pass
+        if runs:
+            plants[plant_dir.name] = runs
+    return plants
+
+
+def bar(width=60):
+    return "─" * width
+
+
+def main():
+    runs = load_runs()
+    if not runs:
+        print("No runs found.")
+        sys.exit(1)
+
+    W = 64
+    cols = f"{'RUN ID':<28} {'STATUS':<10} {'COST':>9} {'TURNS':>5} {'DURATION':>9}"
+
+    print()
+    print("╔" + "═" * W + "╗")
+    print("║" + " TELOS RUN REPORT".center(W) + "║")
+    print("╚" + "═" * W + "╝")
+    print()
+    print(cols)
+    print(bar(W))
+
+    for m in runs:
+        run_id = m.get("run_id", "?")
+        status = m.get("status", "?")
+        cost = get_cost(m)
+        turns = m.get("num_turns")
+        duration = m.get("duration_ms")
+
+        # Status styling
+        status_label = {
+            "success": "success",
+            "completed": "success",
+            "running": "running",
+            "failed": "FAILED",
+        }.get(status, status)
+
+        print(f"{run_id:<28} {status_label:<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
+
+    print()
+
+    # ── Summary stats ────────────────────────────────────────────────────────
+    done = [m for m in runs if m.get("status") in ("success", "completed")]
+    costs = [(m.get("run_id"), get_cost(m)) for m in done if get_cost(m) is not None]
+    turns_vals = [m.get("num_turns") for m in done if m.get("num_turns") is not None]
+
+    print("SUMMARY STATS")
+    print(bar(W))
+
+    if costs:
+        cost_vals = [c for _, c in costs]
+        cheapest = min(costs, key=lambda x: x[1])
+        priciest = max(costs, key=lambda x: x[1])
+        print(f"  Runs with cost data:     {len(costs)}")
+        print(f"  Total cost:              {fmt_cost(sum(cost_vals))}")
+        print(f"  Average cost / run:      {fmt_cost(sum(cost_vals) / len(cost_vals))}")
+        print(f"  Cheapest run:            {cheapest[0]}  ({fmt_cost(cheapest[1])})")
+        print(f"  Most expensive run:      {priciest[0]}  ({fmt_cost(priciest[1])})")
+    else:
+        print("  No cost data available.")
+
+    if turns_vals:
+        print(f"  Average turns / run:     {sum(turns_vals) / len(turns_vals):.1f}")
+
+    print()
+
+    # ── Cost trend ───────────────────────────────────────────────────────────
+    print("COST TREND  (last 5 runs with cost data)")
+    print(bar(W))
+
+    # Use all runs (including running) that have cost data
+    all_with_cost = [(m.get("run_id", "?"), get_cost(m)) for m in runs if get_cost(m) is not None]
+    last5 = all_with_cost[-5:]
+
+    if len(last5) < 2:
+        print("  Not enough data to compute trend.")
+    else:
+        max_cost = max(c for _, c in last5)
+        bar_scale = 20 / max_cost if max_cost > 0 else 1
+
+        for rid, c in last5:
+            filled = int(c * bar_scale)
+            cost_bar = "█" * filled + "░" * (20 - filled)
+            print(f"  {rid:<28} {fmt_cost(c):>9}  {cost_bar}")
+
+        mid = len(last5) // 2
+        avg_first = sum(c for _, c in last5[:mid]) / mid
+        avg_second = sum(c for _, c in last5[mid:]) / len(last5[mid:])
+        delta = avg_second - avg_first
+        pct = abs(delta) / avg_first * 100 if avg_first else 0
+        direction = "▲ UP" if delta > 0 else "▼ DOWN"
+        print()
+        print(f"  Trend: {direction}  ({pct:.0f}%  {fmt_cost(avg_first)} → {fmt_cost(avg_second)})")
+
+    print()
+
+    # ── Health section ────────────────────────────────────────────────────────
+    print_health_section(W)
+
+    # ── Plants section ────────────────────────────────────────────────────────
+    print_plants_section(W, cols)
+
+
+def run_age_secs(meta, run_dir):
+    """Returns age in seconds for a running run, or None if unavailable."""
+    started_at = meta.get("started_at")
+    if started_at:
+        try:
+            dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt).total_seconds()
+        except ValueError:
+            pass
+    try:
+        return time.time() - run_dir.stat().st_mtime
+    except OSError:
+        return None
+
+
+def get_health_issues():
+    """Returns (missing_reflections, stale_runs, active_runs, pending_by_plant).
+
+    stale_runs: status==running and age > STALE_THRESHOLD_SECS (or no age info)
+    active_runs: status==running and age <= STALE_THRESHOLD_SECS
+    """
+    missing_reflections = []
+    stale_runs = []
+    active_runs = []
+
+    if RUNS_DIR.is_dir():
+        for run_dir in sorted(RUNS_DIR.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            meta_file = run_dir / "meta.json"
+            if not meta_file.exists():
+                continue
+            try:
+                with open(meta_file) as f:
+                    meta = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            status = meta.get("status")
+            if status == "running":
+                age = run_age_secs(meta, run_dir)
+                if age is None or age > STALE_THRESHOLD_SECS:
+                    stale_runs.append(f"root/{run_dir.name}")
+                else:
+                    active_runs.append(f"root/{run_dir.name}")
+                continue
+            if not (run_dir / "reflection.md").exists():
+                missing_reflections.append(f"root/{run_dir.name}")
+
+    if PLANTS_DIR.is_dir():
+        for plant_dir in sorted(PLANTS_DIR.iterdir()):
+            runs_dir = plant_dir / "runs"
+            if not runs_dir.is_dir():
+                continue
+            for run_dir in sorted(runs_dir.iterdir()):
+                if not run_dir.is_dir():
+                    continue
+                meta_file = run_dir / "meta.json"
+                if not meta_file.exists():
+                    continue
+                try:
+                    with open(meta_file) as f:
+                        meta = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                status = meta.get("status")
+                if status == "running":
+                    age = run_age_secs(meta, run_dir)
+                    if age is None or age > STALE_THRESHOLD_SECS:
+                        stale_runs.append(f"{plant_dir.name}/{run_dir.name}")
+                    else:
+                        active_runs.append(f"{plant_dir.name}/{run_dir.name}")
+                    continue
+                if not (run_dir / "reflection.md").exists():
+                    missing_reflections.append(f"{plant_dir.name}/{run_dir.name}")
+
+    pending_by_plant = {}
+    if PLANTS_DIR.is_dir():
+        for plant_dir in sorted(PLANTS_DIR.iterdir()):
+            count = len(get_pending_goals(plant_dir))
+            if count > 0:
+                pending_by_plant[plant_dir.name] = count
+
+    return missing_reflections, stale_runs, active_runs, pending_by_plant
+
+
+def print_health_section(W):
+    missing, stale, active, pending = get_health_issues()
+
+    print("HEALTH")
+    print(bar(W))
+
+    if not missing and not stale and not active and not pending:
+        print("  all clear")
+        print()
+        return
+
+    for s in stale:
+        print(f"  {s}  stale")
+    for a in active:
+        print(f"  {a}  running")
+    for m in missing:
+        print(f"  {m}  missing reflection")
+    for plant, count in pending.items():
+        print(f"  {plant}  {count} pending goals")
+
+    print()
+
+
+def get_pending_goals(plant_dir):
+    """Returns list of goal stems that have no matching run directory."""
+    goals_dir = plant_dir / "goals"
+    runs_dir = plant_dir / "runs"
+    if not goals_dir.is_dir():
+        return []
+    run_prefixes = set()
+    if runs_dir.is_dir():
+        for run_dir in runs_dir.iterdir():
+            if run_dir.is_dir():
+                run_prefixes.add(run_dir.name[:3])
+    pending = []
+    for goal_file in sorted(goals_dir.glob("*.md")):
+        if goal_file.stem[:3] not in run_prefixes:
+            pending.append(goal_file.stem)
+    return pending
+
+
+def print_plant_stats(runs, W):
+    """Print per-plant summary stats block."""
+    done = [m for m in runs if m.get("status") in ("success", "completed")]
+    costs = [(m.get("run_id"), get_cost(m)) for m in done if get_cost(m) is not None]
+    turns_vals = [m.get("num_turns") for m in done if m.get("num_turns") is not None]
+
+    if costs:
+        cost_vals = [c for _, c in costs]
+        print(f"  Runs with cost data:     {len(costs)}")
+        print(f"  Total cost:              {fmt_cost(sum(cost_vals))}")
+        print(f"  Average cost / run:      {fmt_cost(sum(cost_vals) / len(cost_vals))}")
+    else:
+        print("  No cost data available.")
+
+    if turns_vals:
+        print(f"  Average turns / run:     {sum(turns_vals) / len(turns_vals):.1f}")
+
+
+def print_plants_section(W, cols):
+    plants = load_plant_runs()
+    if not plants:
+        print("╔" + "═" * W + "╗")
+        print("║" + " PLANTS".center(W) + "║")
+        print("╚" + "═" * W + "╝")
+        print()
+        print("  No plants found.")
+        print()
+        return
+
+    print("╔" + "═" * W + "╗")
+    print("║" + " PLANTS".center(W) + "║")
+    print("╚" + "═" * W + "╝")
+
+    for plant_name, runs in plants.items():
+        print()
+        print(f"  PLANT: {plant_name}")
+        print("  " + bar(W - 2))
+        print("  " + cols)
+        print("  " + bar(W - 2))
+
+        for m in runs:
+            run_id = m.get("run_id", "?")
+            status = m.get("status", "?")
+            cost = get_cost(m)
+            turns = m.get("num_turns")
+            duration = m.get("duration_ms")
+
+            status_label = {
+                "success": "success",
+                "completed": "success",
+                "running": "running",
+                "failed": "FAILED",
+            }.get(status, status)
+
+            print("  " + f"{run_id:<28} {status_label:<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
+
+        print()
+        print(f"  STATS: {plant_name}")
+        print("  " + bar(W - 2))
+        print_plant_stats(runs, W)
+
+        pending = get_pending_goals(PLANTS_DIR / plant_name)
+        if pending:
+            print()
+            print(f"  PENDING GOALS: {plant_name}")
+            print("  " + bar(W - 2))
+            for g in pending:
+                print(f"  {g}")
+
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "personalagentkit/run",
+  "title": "Run",
+  "description": "A structured record of one goal execution attempt",
+  "type": "object",
+  "required": ["run_id", "goal_file", "started_at", "status"],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Unique identifier, typically NNN-slug matching the goal file"
+    },
+    "goal_file": {
+      "type": "string",
+      "description": "Path to the goal file, relative to repo root"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["running", "success", "failure", "partial"]
+    },
+    "agent": {
+      "type": "string",
+      "description": "Model identifier used for the run"
+    },
+    "cost": {
+      "type": "object",
+      "description": "Token usage and actual cost — required for any completed run",
+      "properties": {
+        "input_tokens": { "type": "integer" },
+        "output_tokens": { "type": "integer" },
+        "cache_read_tokens": { "type": "integer" },
+        "cache_write_tokens": { "type": "integer" },
+        "actual_usd": { "type": "number" }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "description": "Files produced by this run, relative to run directory",
+      "items": { "type": "string" }
+    },
+    "num_turns": {
+      "type": "integer",
+      "description": "Number of agent turns in the run"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "description": "Elapsed wall-clock time in milliseconds"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Free-form notes from the agent about this run"
+    }
+  }
+}

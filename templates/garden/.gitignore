@@ -1,0 +1,5 @@
+.telos-git.lock
+.telos-pause
+.telos-stop
+__pycache__/
+secrets/

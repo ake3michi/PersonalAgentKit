@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# personalagentkit-genesis — Bootstrap the first garden (the coordinator)
+
+set -euo pipefail
+
+GROUP_ROOT="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE_DIR="$GROUP_ROOT/templates/garden"
+COORDINATOR_DIR="$GROUP_ROOT/coordinator"
+
+die() { echo "personalagentkit-genesis: $*" >&2; exit 1; }
+
+# 1. Verification
+echo "── PersonalAgentKit Genesis ────────────────────────────────────────────────"
+[[ -d "$TEMPLATE_DIR" ]] || die "template directory not found: $TEMPLATE_DIR"
+[[ -f "$GROUP_ROOT/shared/charter.md" ]] || die "shared/charter.md not found — please create it first"
+
+if [[ -d "$COORDINATOR_DIR" ]]; then
+  echo "Coordinator garden already exists at $COORDINATOR_DIR"
+  read -p "Overwrite? (y/N): " -n 1 -r
+  echo
+  [[ $REPLY =~ ^[Yy]$ ]] || die "Aborting"
+  rm -rf "$COORDINATOR_DIR"
+fi
+
+# 2. Bootstrap the Coordinator Garden
+echo "Bootstrapping coordinator garden..."
+mkdir -p "$COORDINATOR_DIR"
+cp -r "$TEMPLATE_DIR"/* "$COORDINATOR_DIR"/
+cp "$TEMPLATE_DIR"/.gitignore "$COORDINATOR_DIR"/ 2>/dev/null || true
+
+# Use the scrubbed coordinator-terroir.md example as the default terroir
+if [[ -f "$GROUP_ROOT/examples/coordinator-terroir.md" ]]; then
+  cp "$GROUP_ROOT/examples/coordinator-terroir.md" "$COORDINATOR_DIR/terroir.md"
+  echo "Using coordinator-terroir.md example as the default mission."
+fi
+
+# 3. Final Prep
+cd "$COORDINATOR_DIR"
+mkdir -p goals horizons inbox memory plants runs schema scripts seeds superseeds skills
+
+# 4. Initialize git
+git init
+git add -A
+git commit -m "coordinator: initial scaffold"
+echo "Git repository initialized."
+
+# 5. Plant the first seed
+echo "Planting the first gardener faculty..."
+./scripts/personalagentkit plant gardener gardener
+
+echo
+echo "── Genesis Complete ────────────────────────────────────────────────────────"
+echo "Your coordinator garden is now alive in ./coordinator/"
+echo "To start the autonomous cycle, run:"
+echo "  cd coordinator && ./scripts/personalagentkit cycle"
+echo
