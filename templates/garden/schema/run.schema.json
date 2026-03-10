@@ -24,21 +24,49 @@
     },
     "status": {
       "type": "string",
-      "enum": ["running", "success", "failure", "partial"]
+      "description": "Canonical run status: running is the only non-terminal value; terminal values are success, failure, killed, and abandoned. Legacy readers may still normalize older completed/failed values during migration, but newly written records must use only the canonical vocabulary.",
+      "enum": ["running", "success", "failure", "killed", "abandoned"]
+    },
+    "driver": {
+      "type": "string",
+      "description": "Resolved execution driver used for the run"
+    },
+    "model": {
+      "type": "string",
+      "description": "Resolved model used for the run"
     },
     "agent": {
       "type": "string",
-      "description": "Model identifier used for the run"
+      "description": "Legacy alias for the resolved model identifier used for the run"
     },
     "cost": {
-      "type": "object",
-      "description": "Token usage and actual cost — required for any completed run",
+      "type": ["object", "null"],
+      "description": "Canonical run cost object. New terminal records should write token totals plus actual_usd and/or estimated_usd with pricing provenance when locally estimated; legacy records may omit newer fields.",
       "properties": {
         "input_tokens": { "type": "integer" },
         "output_tokens": { "type": "integer" },
         "cache_read_tokens": { "type": "integer" },
         "cache_write_tokens": { "type": "integer" },
-        "actual_usd": { "type": "number" }
+        "actual_usd": { "type": ["number", "null"] },
+        "estimated_usd": { "type": ["number", "null"] },
+        "pricing": {
+          "type": ["object", "null"],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": ["provider-native", "local-estimate"]
+            },
+            "provider": { "type": ["string", "null"] },
+            "model": { "type": ["string", "null"] },
+            "version": { "type": ["string", "null"] },
+            "retrieved_at": {
+              "type": ["string", "null"],
+              "format": "date-time"
+            },
+            "notes": { "type": ["string", "null"] }
+          },
+          "required": ["source"]
+        }
       }
     },
     "outputs": {

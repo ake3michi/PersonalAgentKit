@@ -10,7 +10,7 @@ from pathlib import Path
 # Matches the stale threshold in ./telos status (telos line 272: elapsed > 7200)
 STALE_THRESHOLD_SECS = 7200
 
-TELOS_ROOT = Path(__file__).parent
+TELOS_ROOT = Path(__file__).parent.parent
 RUNS_DIR = TELOS_ROOT / "runs"
 PLANTS_DIR = TELOS_ROOT / "plants"
 
@@ -41,16 +41,34 @@ def fmt_turns(n):
     return "—" if n is None else str(n)
 
 
+def parse_iso(raw):
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def load_meta(meta_file, scope):
+    try:
+        with open(meta_file) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    data["_scope"] = scope
+    data["_run_dir"] = str(meta_file.parent)
+    return data
+
+
 def load_runs():
     runs = []
     for run_dir in sorted(RUNS_DIR.iterdir()):
         meta_file = run_dir / "meta.json"
         if meta_file.exists():
-            try:
-                with open(meta_file) as f:
-                    runs.append(json.load(f))
-            except (json.JSONDecodeError, OSError):
-                pass
+            meta = load_meta(meta_file, "root")
+            if meta is not None:
+                runs.append(meta)
     return runs
 
 
@@ -67,23 +85,67 @@ def load_plant_runs():
         for run_dir in sorted(runs_dir.iterdir()):
             meta_file = run_dir / "meta.json"
             if meta_file.exists():
-                try:
-                    with open(meta_file) as f:
-                        runs.append(json.load(f))
-                except (json.JSONDecodeError, OSError):
-                    pass
+                meta = load_meta(meta_file, plant_dir.name)
+                if meta is not None:
+                    runs.append(meta)
         if runs:
             plants[plant_dir.name] = runs
     return plants
+
+
+def sort_runs(runs):
+    def sort_key(meta):
+        ts = (
+            parse_iso(meta.get("completed_at"))
+            or parse_iso(meta.get("started_at"))
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        return (ts, meta.get("_scope", ""), meta.get("run_id", ""))
+
+    return sorted(runs, key=sort_key)
+
+
+def load_all_runs():
+    runs = load_runs()
+    for plant_runs in load_plant_runs().values():
+        runs.extend(plant_runs)
+    return sort_runs(runs)
 
 
 def bar(width=60):
     return "─" * width
 
 
+def display_run_id(meta):
+    run_id = meta.get("run_id", "?")
+    scope = meta.get("_scope", "root")
+    return run_id if scope == "root" else f"{scope}/{run_id}"
+
+
+def status_label(meta):
+    status = meta.get("status", "?")
+    if status == "completed":
+        status = "success"
+    elif status == "failed":
+        status = "failure"
+
+    if status == "running":
+        run_dir = Path(meta["_run_dir"]) if meta.get("_run_dir") else None
+        age = run_age_secs(meta, run_dir) if run_dir is not None else None
+        if age is None or age > STALE_THRESHOLD_SECS:
+            return "stale"
+        return "running"
+
+    return {
+        "success": "success",
+        "failure": "FAILED",
+    }.get(status, status)
+
+
 def main():
-    runs = load_runs()
-    if not runs:
+    root_runs = load_runs()
+    all_runs = load_all_runs()
+    if not all_runs:
         print("No runs found.")
         sys.exit(1)
 
@@ -98,28 +160,18 @@ def main():
     print(cols)
     print(bar(W))
 
-    for m in runs:
-        run_id = m.get("run_id", "?")
-        status = m.get("status", "?")
+    for m in all_runs:
+        run_id = display_run_id(m)
         cost = get_cost(m)
         turns = m.get("num_turns")
         duration = m.get("duration_ms")
-
-        # Status styling
-        status_label = {
-            "success": "success",
-            "completed": "success",
-            "running": "running",
-            "failed": "FAILED",
-        }.get(status, status)
-
-        print(f"{run_id:<28} {status_label:<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
+        print(f"{run_id:<28} {status_label(m):<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
 
     print()
 
     # ── Summary stats ────────────────────────────────────────────────────────
-    done = [m for m in runs if m.get("status") in ("success", "completed")]
-    costs = [(m.get("run_id"), get_cost(m)) for m in done if get_cost(m) is not None]
+    done = [m for m in all_runs if m.get("status") in ("success", "completed")]
+    costs = [(display_run_id(m), get_cost(m)) for m in done if get_cost(m) is not None]
     turns_vals = [m.get("num_turns") for m in done if m.get("num_turns") is not None]
 
     print("SUMMARY STATS")
@@ -147,7 +199,7 @@ def main():
     print(bar(W))
 
     # Use all runs (including running) that have cost data
-    all_with_cost = [(m.get("run_id", "?"), get_cost(m)) for m in runs if get_cost(m) is not None]
+    all_with_cost = [(display_run_id(m), get_cost(m)) for m in all_runs if get_cost(m) is not None]
     last5 = all_with_cost[-5:]
 
     if len(last5) < 2:
@@ -176,7 +228,7 @@ def main():
     print_health_section(W)
 
     # ── Plants section ────────────────────────────────────────────────────────
-    print_plants_section(W, cols)
+    print_plants_section(root_runs, W, cols)
 
 
 def run_age_secs(meta, run_dir):
@@ -323,14 +375,17 @@ def print_plant_stats(runs, W):
         print(f"  Average turns / run:     {sum(turns_vals) / len(turns_vals):.1f}")
 
 
-def print_plants_section(W, cols):
+def print_plants_section(root_runs, W, cols):
     plants = load_plant_runs()
     if not plants:
         print("╔" + "═" * W + "╗")
         print("║" + " PLANTS".center(W) + "║")
         print("╚" + "═" * W + "╝")
         print()
-        print("  No plants found.")
+        if root_runs:
+            print("  No plants found.")
+        else:
+            print("  No plant runs found.")
         print()
         return
 
@@ -347,19 +402,10 @@ def print_plants_section(W, cols):
 
         for m in runs:
             run_id = m.get("run_id", "?")
-            status = m.get("status", "?")
             cost = get_cost(m)
             turns = m.get("num_turns")
             duration = m.get("duration_ms")
-
-            status_label = {
-                "success": "success",
-                "completed": "success",
-                "running": "running",
-                "failed": "FAILED",
-            }.get(status, status)
-
-            print("  " + f"{run_id:<28} {status_label:<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
+            print("  " + f"{run_id:<28} {status_label(m):<10} {fmt_cost(cost):>9} {fmt_turns(turns):>5} {fmt_duration(duration):>9}")
 
         print()
         print(f"  STATS: {plant_name}")

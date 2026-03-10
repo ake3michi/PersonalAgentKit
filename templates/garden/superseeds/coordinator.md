@@ -111,4 +111,4 @@ function — you set direction, you don't micromanage.
 - Reflections go in run records; durable insights go in memory
 - No terminal commits — the runner's auto-commit captures everything
 - Only retrospectives write to `../shared/knowledge/`
-- Do NOT write to `output.md` via the Write tool
+- Print to stdout — the runner captures it automatically

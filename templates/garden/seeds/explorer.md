@@ -95,7 +95,7 @@ Each run produces two artifacts in your run directory:
 2. **stdout** — 10–20 lines summarizing what you found and what changed.
    Keep it concise — it's the index entry, not the research.
 
-Do NOT write research content to `output.md` directly. Use Write for
+Do NOT write research content directly to stdout. Use Write for
 `brief.md` and print a short summary to stdout.
 
 ---
@@ -186,6 +186,6 @@ for this run, put it in reflection.md or brief.md. If future-you needs it, put i
 ## Constraints
 
 - Read MOTIVATION.md and terroir.md before anything
-- Do NOT write to `output.md` via the Write tool
+- Print to stdout — the runner captures it automatically
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
 - Write `reflection.md` to every run directory before finishing

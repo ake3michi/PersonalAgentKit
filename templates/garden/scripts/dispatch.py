@@ -23,6 +23,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+STATUS_ALIASES = {
+    "completed": "success",
+    "failed": "failure",
+}
+TERMINAL_STATUSES = {"success", "failure", "killed", "abandoned"}
+
+
+def normalize_run_status(status: Optional[str]) -> Optional[str]:
+    if status is None:
+        return None
+    return STATUS_ALIASES.get(status, status)
+
+
+def preferred_run_cost_usd(meta: dict) -> Optional[float]:
+    cost = meta.get("cost")
+    if isinstance(cost, (int, float)):
+        return float(cost)
+    if not isinstance(cost, dict):
+        return None
+    if cost.get("actual_usd") is not None:
+        return float(cost["actual_usd"])
+    if cost.get("estimated_usd") is not None:
+        return float(cost["estimated_usd"])
+    return None
+
 
 @dataclass(order=True)
 class GoalEntry:
@@ -30,6 +55,8 @@ class GoalEntry:
     nnn: int
     goal_rel: str = field(compare=False)
     assigned_to: str = field(compare=False)
+    driver: str = field(compare=False, default="")
+    model: str = field(compare=False, default="")
 
 
 class Dispatcher:
@@ -82,7 +109,7 @@ class Dispatcher:
                         continue
                     try:
                         data = json.loads(meta_path.read_text())
-                        if data.get("status") != "running":
+                        if normalize_run_status(data.get("status")) != "running":
                             continue
                         started_raw = data.get("started_at", "")
                         if not started_raw:
@@ -153,8 +180,9 @@ class Dispatcher:
         Dependency syntax:
           NNN-slug          — satisfied when run succeeds (default, backward compatible)
           NNN-slug:done     — satisfied when run completes with any status
-          NNN-slug:failed   — satisfied only when run fails
+          NNN-slug:failure  — satisfied only when run fails
           NNN-slug:killed   — satisfied only when run is killed
+          NNN-slug:abandoned — satisfied only when run is abandoned
           NNN-slug:success  — explicit success (same as no qualifier)
         """
         dep = dep.strip()
@@ -165,13 +193,12 @@ class Dispatcher:
         required_status = "success"
         if ":" in dep:
             dep, required_status = dep.rsplit(":", 1)
+        required_status = normalize_run_status(required_status)
 
         if dep and dep[0].isdigit():
             pattern = dep
         else:
             pattern = f"*-{dep}"
-
-        terminal_statuses = {"success", "failure", "killed"}
 
         def check_dir(runs_dir: Path):
             """Returns (found_terminal, matched) for best match in this dir."""
@@ -180,8 +207,8 @@ class Dispatcher:
                 if meta.exists():
                     try:
                         data = json.loads(meta.read_text())
-                        status = data.get("status", "")
-                        if status not in terminal_statuses:
+                        status = normalize_run_status(data.get("status", ""))
+                        if status not in TERMINAL_STATUSES:
                             return "pending"
                         if required_status == "done":
                             return "satisfied"
@@ -233,6 +260,8 @@ class Dispatcher:
             requires_raw = ""
             not_before_raw = ""
             priority = 5
+            driver = ""
+            model = ""
             try:
                 text = goal_path.read_text()
                 if text.startswith("---"):
@@ -253,6 +282,10 @@ class Dispatcher:
                                     priority = int(line.split(":", 1)[1].strip())
                                 except ValueError:
                                     pass
+                            elif line.startswith("driver:"):
+                                driver = line.split(":", 1)[1].strip()
+                            elif line.startswith("model:"):
+                                model = line.split(":", 1)[1].strip()
             except Exception:
                 pass
 
@@ -322,7 +355,7 @@ class Dispatcher:
                     continue
 
             goal_rel = f"goals/{base}.md"
-            entries.append(GoalEntry(priority, nnn_int, goal_rel, assigned_to))
+            entries.append(GoalEntry(priority, nnn_int, goal_rel, assigned_to, driver, model))
 
         return sorted(entries), blocked, earliest_not_before
 
@@ -378,6 +411,70 @@ class Dispatcher:
 
     # ── running plant check ───────────────────────────────────────────────────
 
+    def _running_run_age_seconds(self, data: dict) -> Optional[float]:
+        started_raw = data.get("started_at", "")
+        if not started_raw:
+            return None
+        try:
+            started_dt = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return (datetime.now(timezone.utc) - started_dt).total_seconds()
+
+    def _running_run_is_zombie(self, run_dir: Path, data: dict) -> tuple[bool, Optional[float]]:
+        age_seconds = self._running_run_age_seconds(data)
+        if age_seconds is None:
+            return True, None
+        if age_seconds >= 600 and not self._run_has_recent_event_activity(run_dir):
+            return True, age_seconds
+        return False, age_seconds
+
+    def _mark_run_killed(self, run_dir: Path, data: dict, age_seconds: Optional[float]) -> None:
+        age_str = f"{int(age_seconds / 60)}m" if age_seconds is not None else "?"
+        print(
+            f"personalagentkit: zombie run detected: {run_dir.name} "
+            f"(status=running but started {age_str} ago) — marking killed",
+            flush=True,
+        )
+        meta = run_dir / "meta.json"
+        try:
+            data["status"] = "killed"
+            data["zombie_cleaned_at"] = datetime.now(timezone.utc).isoformat()
+            data["zombie_note"] = "Cleaned by dispatcher zombie detection (status=running but process not alive)"
+            meta.write_text(json.dumps(data, indent=2) + "\n")
+        except Exception as e:
+            print(f"personalagentkit: warning: could not update zombie meta.json: {e}", flush=True)
+
+    def _active_running_runs(self, plant: str) -> list[str]:
+        plant_runs = self.repo_root / "plants" / plant / "runs"
+        if not plant_runs.is_dir():
+            return []
+
+        active_run_ids: list[str] = []
+        for run_dir in sorted(plant_runs.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            meta = run_dir / "meta.json"
+            if not meta.exists():
+                continue
+            try:
+                data = json.loads(meta.read_text())
+            except Exception:
+                continue
+            if normalize_run_status(data.get("status")) != "running":
+                continue
+
+            is_zombie, age_seconds = self._running_run_is_zombie(run_dir, data)
+            if is_zombie:
+                if self._recover_stale_run(run_dir, data):
+                    continue
+                self._mark_run_killed(run_dir, data, age_seconds)
+                continue
+
+            active_run_ids.append(run_dir.name)
+
+        return active_run_ids
+
     def _plant_has_running_run(self, plant: str) -> tuple[bool, str]:
         """Check if a plant already has an active run by reading meta.json files.
 
@@ -387,75 +484,62 @@ class Dispatcher:
         Note: zombie detection is only applied for the gardener plant (coder and
         reviewer runs are not expected to be long-running background daemons).
         """
-        plant_runs = self.repo_root / "plants" / plant / "runs"
-        if not plant_runs.is_dir():
+        active_run_ids = self._active_running_runs(plant)
+        if not active_run_ids:
             return False, ""
+        return True, active_run_ids[-1]
 
-        # Find the most recently modified meta.json
-        latest_run_id = ""
-        latest_mtime = 0.0
-        for run_dir in plant_runs.iterdir():
-            if not run_dir.is_dir():
-                continue
-            meta = run_dir / "meta.json"
-            if not meta.exists():
-                continue
-            try:
-                mtime = meta.stat().st_mtime
-                if mtime > latest_mtime:
-                    latest_mtime = mtime
-                    latest_run_id = run_dir.name
-            except Exception:
-                pass
-
-        if not latest_run_id:
-            return False, ""
-
-        meta = plant_runs / latest_run_id / "meta.json"
+    def _run_has_recent_event_activity(self, run_dir: Path, idle_timeout: int = 600) -> bool:
+        events_path = run_dir / "events.jsonl"
+        if not events_path.exists():
+            return False
         try:
-            data = json.loads(meta.read_text())
-            if data.get("status") == "running":
-                # Zombie detection: if started_at is more than 10 minutes ago,
-                # the run is a zombie (crashed mid-run, left status=running).
-                # Threshold is 600s because the watchdog kills any process that
-                # exceeds that timeout — so any run older than 600s is guaranteed stuck.
-                started_raw = data.get("started_at", "")
-                is_zombie = False
-                age_seconds = None
-                if started_raw:
-                    try:
-                        started_dt = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
-                        age_seconds = (datetime.now(timezone.utc) - started_dt).total_seconds()
-                        if age_seconds >= 600:  # 10 minutes = watchdog timeout
-                            is_zombie = True
-                    except Exception:
-                        # Malformed started_at — can't determine age, treat as zombie to unblock
-                        is_zombie = True
-                else:
-                    # No started_at — can't verify age, treat as zombie to unblock
-                    is_zombie = True
+            age_seconds = time.time() - events_path.stat().st_mtime
+        except OSError:
+            return False
+        return age_seconds < idle_timeout
 
-                if is_zombie:
-                    age_str = f"{int(age_seconds / 60)}m" if age_seconds is not None else "?"
-                    print(
-                        f"personalagentkit: zombie run detected: {latest_run_id} "
-                        f"(status=running but started {age_str} ago) — marking failed",
-                        flush=True,
-                    )
-                    try:
-                        data["status"] = "failed"
-                        data["zombie_cleaned_at"] = datetime.now(timezone.utc).isoformat()
-                        data["zombie_note"] = "Cleaned by dispatcher zombie detection (status=running but process not alive)"
-                        meta.write_text(json.dumps(data, indent=2))
-                    except Exception as e:
-                        print(f"personalagentkit: warning: could not update zombie meta.json: {e}", flush=True)
-                    return False, ""
+    def _recover_stale_run(self, run_dir: Path, meta: dict) -> bool:
+        driver = meta.get("driver")
+        model = meta.get("model")
+        if not driver or not model:
+            return False
 
-                return True, latest_run_id
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runner.host",
+                    "recover",
+                    "--driver",
+                    str(driver),
+                    "--model",
+                    str(model),
+                    "--run-dir",
+                    str(run_dir),
+                ],
+                cwd=self.repo_root,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
         except Exception:
-            pass
+            return False
 
-        return False, ""
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return False
+
+        if payload.get("recoverable"):
+            print(
+                f"personalagentkit: recovered completed run from events: {run_dir.name} "
+                f"({payload.get('status', 'unknown')})",
+                flush=True,
+            )
+            return True
+        return False
 
     # ── work detection ────────────────────────────────────────────────────────
 
@@ -532,13 +616,13 @@ class Dispatcher:
         telos = str(self.repo_root / "scripts" / "personalagentkit")
 
         try:
-            if assigned_to:
-                self._auto_scaffold_plant(assigned_to)
-                cmd = [telos, "plant-run", assigned_to, goal_rel]
-                label = f"{assigned_to}/{goal_rel}"
-            else:
-                cmd = [telos, "run", goal_rel]
-                label = goal_rel
+            label = f"{assigned_to}/{goal_rel}" if assigned_to else goal_rel
+            cmd = [telos, "run", goal_rel]
+
+            if entry.driver:
+                cmd.extend(["--driver", entry.driver])
+            if entry.model:
+                cmd.extend(["--model", entry.model])
 
             print(f"personalagentkit: dispatch → {label}", flush=True)
             result = subprocess.run(cmd, cwd=str(self.repo_root))
@@ -554,9 +638,10 @@ class Dispatcher:
                     meta_path = self.repo_root / "runs" / goal_id / "meta.json"
                 try:
                     data = json.loads(meta_path.read_text())
-                    run_cost = float(data.get("cost", {}).get("actual_usd", 0) or 0)
-                    with self.lock:
-                        self.cycle_cost += run_cost
+                    run_cost = preferred_run_cost_usd(data)
+                    if run_cost is not None:
+                        with self.lock:
+                            self.cycle_cost += run_cost
                 except Exception:
                     pass
 
@@ -571,13 +656,12 @@ class Dispatcher:
 
     def _monitor_restored_run(self, plant_name: str, run_id: str, goal_rel: str):
         """Poll a startup-restored non-gardener run until terminal, then release slot."""
-        terminal_statuses = {"success", "abandoned", "failure", "killed"}
         meta_path = self.repo_root / "plants" / plant_name / "runs" / run_id / "meta.json"
         while not self._stop_set():
             time.sleep(5)
             try:
                 data = json.loads(meta_path.read_text())
-                if data.get("status") in terminal_statuses:
+                if normalize_run_status(data.get("status")) in TERMINAL_STATUSES:
                     with self.lock:
                         self.active_slots -= 1
                         self.in_progress.discard(goal_rel)
@@ -667,7 +751,7 @@ class Dispatcher:
                 )
                 try:
                     data = json.loads(meta_path.read_text())
-                    if data.get("status") not in (None, "running"):
+                    if normalize_run_status(data.get("status")) not in (None, "running"):
                         with self.lock:
                             self.gardener_running = False
                         self._startup_gardener_run_id = None
@@ -690,8 +774,6 @@ class Dispatcher:
         completed runs (non-tend, non-retrospective) since that timestamp.
         Returns False if fewer than min_new_runs exist.
         """
-        terminal_statuses = {"success", "abandoned", "failure", "killed"}
-
         # Collect all run meta.json paths across all plants and the root runs dir
         search_dirs = [self.repo_root / "runs"] + list(
             (self.repo_root / "plants").glob("*/runs/")
@@ -712,7 +794,7 @@ class Dispatcher:
                     continue
                 try:
                     data = json.loads(meta.read_text())
-                    if data.get("status") not in terminal_statuses:
+                    if normalize_run_status(data.get("status")) not in TERMINAL_STATUSES:
                         continue
                     started_raw = data.get("started_at", "")
                     if not started_raw:
@@ -743,7 +825,7 @@ class Dispatcher:
                     continue
                 try:
                     data = json.loads(meta.read_text())
-                    if data.get("status") not in terminal_statuses:
+                    if normalize_run_status(data.get("status")) not in TERMINAL_STATUSES:
                         continue
                     completed_raw = data.get("completed_at", "")
                     if not completed_raw:

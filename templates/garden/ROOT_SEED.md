@@ -123,7 +123,6 @@ Self-sufficiency is a long-term aspiration, not an immediate pressure.
 
 Every goal produces a run record:
 - `meta.json` — structured record: status, cost, duration, turns
-- `output.md` — what the agent produced
 - `reflection.md` — what the agent learned (not what it did)
 - `events.jsonl` — raw event stream
 

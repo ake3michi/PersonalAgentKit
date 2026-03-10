@@ -7,7 +7,7 @@
 #
 # Produces:
 #   runs/<goal-id>/meta.json   — structured run record
-#   runs/<goal-id>/output.md   — agent output
+#   runs/<goal-id>/_stdout.md   — agent output
 #
 # Principles honored:
 #   P2: meta.json is schema-validated structure
@@ -46,33 +46,119 @@ iso_to_epoch() {
     || echo 0
 }
 
+normalize_status() {
+  case "${1:-}" in
+    completed) echo "success" ;;
+    failed) echo "failure" ;;
+    *) echo "${1:-}" ;;
+  esac
+}
+
+is_terminal_status() {
+  case "$(normalize_status "${1:-}")" in
+    success|failure|killed|abandoned) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+legacy_status_summary() {
+  local legacy_found=()
+  local meta raw
+  for meta in \
+      "$REPO_ROOT/runs"/*/meta.json \
+      "$REPO_ROOT/plants"/*/runs/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    raw=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+    case "$raw" in
+      completed|failed)
+        legacy_found+=("$raw")
+        ;;
+    esac
+  done
+
+  if [[ "${#legacy_found[@]}" -eq 0 ]]; then
+    echo "Legacy compatibility: reading completed->success and failed->failure for older records; new runs write only canonical statuses."
+    return
+  fi
+
+  local unique=""
+  local item
+  for item in "${legacy_found[@]}"; do
+    case " $unique " in
+      *" $item "*) ;;
+      *) unique="${unique:+$unique, }$item" ;;
+    esac
+  done
+  echo "Legacy compatibility: reading completed->success and failed->failure for older records. Present in current run records: ${unique}."
+}
+
 # ── driver config ─────────────────────────────────────────────────────────────
 
-PAK_DRIVER="${PAK_DRIVER:-claude}"
-PAK_MODEL="${PAK_MODEL:-}"
+PAK_DEFAULT_DRIVER="${PAK_DRIVER:-$(cat "$REPO_ROOT/.personalagentkit-driver" 2>/dev/null || echo claude)}"
+PAK_DEFAULT_MODEL="${PAK_MODEL:-}"
+PAK_DRIVER=""
+PAK_MODEL=""
+_driver_bin=""
+_driver_model=""
 
-case "$PAK_DRIVER" in
-  claude)
-    _driver_bin="claude"
-    _driver_model="${PAK_MODEL:-claude-sonnet-4-6}"
-    ;;
-  codex)
-    _driver_bin="codex"
-    _driver_model="${PAK_MODEL:-gpt-5.4}"
-    ;;
-  *)
-    die "unknown driver: $PAK_DRIVER (supported: claude, codex)"
-    ;;
-esac
+resolve_driver_config() {
+  local requested_driver="${1:-}"
+  local requested_model="${2:-}"
+  local cmd=(python3 -m runner.host resolve)
+  [[ -n "$requested_driver" ]] && cmd+=(--driver "$requested_driver")
+  [[ -n "$requested_model" ]] && cmd+=(--model "$requested_model")
+
+  local resolved_json
+  resolved_json=$(cd "$REPO_ROOT" && "${cmd[@]}") || die "driver resolution failed"
+
+  PAK_DRIVER=$(echo "$resolved_json" | jq -r '.driver')
+  PAK_MODEL=$(echo "$resolved_json" | jq -r '.model')
+  _driver_bin=$(echo "$resolved_json" | jq -r '.binary')
+  _driver_model="$PAK_MODEL"
+}
 
 goal_id_from_file() {
   # goals/001-bootstrap.md → 001-bootstrap
   basename "$1" .md
 }
 
+classify_goal_type() {
+  local slug="${1:-}"
+  slug=$(basename "$slug" .md)
+  slug="${slug,,}"
+
+  if [[ "$slug" =~ ^[0-9]+[-_]+(.+)$ ]]; then
+    slug="${BASH_REMATCH[1]}"
+  fi
+
+  local IFS='-_'
+  read -r -a goal_tokens <<< "$slug"
+  local first_token="${goal_tokens[0]:-}"
+  local last_token="${goal_tokens[${#goal_tokens[@]}-1]:-}"
+
+  case "$first_token" in
+    integrate) echo "integrate" ;;
+    retrospective) echo "retrospective" ;;
+    tend) echo "tend" ;;
+    genesis) echo "genesis" ;;
+    dispatch) echo "dispatch" ;;
+    review) echo "review" ;;
+    spike) echo "spike" ;;
+    fix) echo "fix" ;;
+    build|"") echo "build" ;;
+    *)
+      if [[ "$last_token" == "spike" ]]; then
+        echo "spike"
+      else
+        echo "build"
+      fi
+      ;;
+  esac
+}
+
 parse_goal_meta() {
   # Usage: parse_goal_meta <goal-file> <field>
-  # field: assigned_to | depends_on | submitted_by
+  # field: assigned_to | depends_on | submitted_by | driver | model
   # Returns the field value, or empty string if not present or no frontmatter.
   local goal_file="$1" field="$2"
   [[ -f "$goal_file" ]] || { echo ""; return; }
@@ -82,6 +168,30 @@ parse_goal_meta() {
   # Extract lines between first --- and second ---, strip the closing ---
   sed -n '2,/^---$/p' "$goal_file" | grep -v '^---$' \
     | grep "^${field}:" | sed "s/^${field}:[[:space:]]*//" | head -1 || true
+}
+
+resolve_goal_routing() {
+  local goal_file="$1"
+  local explicit_driver="${2:-}"
+  local explicit_model="${3:-}"
+  local goal_driver goal_model resolved_driver resolved_model
+
+  goal_driver=$(parse_goal_meta "$goal_file" driver)
+  goal_model=$(parse_goal_meta "$goal_file" model)
+  resolved_driver="${explicit_driver:-${goal_driver:-$PAK_DEFAULT_DRIVER}}"
+  resolved_model="${explicit_model:-${goal_model:-$PAK_DEFAULT_MODEL}}"
+
+  resolve_driver_config "$resolved_driver" "$resolved_model"
+}
+
+preferred_cost_from_meta() {
+  local meta="$1"
+  jq -r '
+    if (.cost | type) == "number" then .cost
+    elif (.cost | type) != "object" then "null"
+    else .cost.actual_usd // .cost.estimated_usd // "null"
+    end
+  ' "$meta" 2>/dev/null
 }
 
 is_dep_satisfied() {
@@ -101,6 +211,7 @@ is_dep_satisfied() {
     [[ -f "${run_dir}meta.json" ]] || continue
     local st
     st=$(jq -r '.status // ""' "${run_dir}meta.json" 2>/dev/null)
+    st=$(normalize_status "$st")
     [[ "$st" == "success" ]] && return 0
   done
   # Check plant runs
@@ -111,6 +222,7 @@ is_dep_satisfied() {
       [[ -f "${run_dir}meta.json" ]] || continue
       local st
       st=$(jq -r '.status // ""' "${run_dir}meta.json" 2>/dev/null)
+      st=$(normalize_status "$st")
       [[ "$st" == "success" ]] && return 0
     done
   done
@@ -120,7 +232,7 @@ is_dep_satisfied() {
 # ── agent invocation ──────────────────────────────────────────────────────────
 #
 # invoke_agent <run_dir> <prompt>
-#   Starts claude with stream-json output, writes events.jsonl + output.md + stderr.txt
+#   Starts claude with stream-json output, writes events.jsonl + _stdout.md + stderr.txt
 #   Runs a no-event watchdog in background (default 300s — catches multi-minute hangs
 #   without firing on legitimate silence during nested subprocess calls like ./personalagentkit plant).
 #   Sets global AGENT_STATUS to: success | failure | killed
@@ -128,149 +240,80 @@ is_dep_satisfied() {
 invoke_agent() {
   local run_dir="$1"
   local prompt="$2"
-  local events_file="$run_dir/events.jsonl"
-
-  # Start agent in background, streaming events to events.jsonl
-  case "$PAK_DRIVER" in
-    claude)
-      echo "$prompt" | CLAUDECODE="" claude \
-            --model "$_driver_model" \
-            --output-format stream-json \
-            --verbose \
-            --dangerously-skip-permissions \
-            >> "$events_file" \
-            2>"$run_dir/stderr.txt" &
-      ;;
-    codex)
-      codex exec - \
-            ${_driver_model:+--model "$_driver_model"} \
-            --dangerously-bypass-approvals-and-sandbox \
-            --json \
-            <<< "$prompt" \
-            >> "$events_file" 2>"$run_dir/stderr.txt" &
-      ;;
-  esac
-  local claude_pid=$!
-
-  # No-event watchdog: kills claude if no new events for 600s (10 minutes)
-  # Catches genuine hangs (e.g. stuck kevent64 network wait, confirmed at 43min)
-  # without firing on legitimate silence during nested subprocess calls (./personalagentkit plant etc.)
-  # Still expect occasional false positives on deeply nested calls (2+ levels deep).
-  (
-    last_size=0
-    idle=0
-    while kill -0 "$claude_pid" 2>/dev/null; do
-      sleep 10
-      cur_size=$(wc -l < "$events_file" 2>/dev/null | tr -d ' ' || echo 0)
-      if (( cur_size == last_size )); then
-        idle=$(( idle + 10 ))
-        if (( idle >= 600 )); then
-          echo '{"type":"watchdog_killed","reason":"no events for 600s"}' >> "$events_file"
-          kill "$claude_pid" 2>/dev/null
-          break
-        fi
-      else
-        idle=0
-        last_size=$cur_size
-      fi
-    done
-  ) &
-  local watchdog_pid=$!
-
-  # Wait for claude to finish; capture exit code without triggering set -e
-  local claude_exit=0
-  wait "$claude_pid" || claude_exit=$?
-
-  # Kill watchdog — prevent zombie if claude exits normally
-  kill "$watchdog_pid" 2>/dev/null
-  wait "$watchdog_pid" 2>/dev/null || true
-
-  # Determine status
-  AGENT_STATUS="success"
-  if grep -q '"type":"watchdog_killed"' "$events_file" 2>/dev/null; then
-    AGENT_STATUS="killed"
-  elif (( claude_exit != 0 )); then
-    AGENT_STATUS="failure"
-  fi
-
-  # Extract text output from the result event
-  case "$PAK_DRIVER" in
-    claude)
-      local result_line
-      result_line=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1)
-      if [[ -n "$result_line" ]]; then
-        echo "$result_line" | jq -r '.result // "no output"' > "$run_dir/output.md" 2>/dev/null \
-          || echo "no output" > "$run_dir/output.md"
-      else
-        echo "no output" > "$run_dir/output.md"
-      fi
-      ;;
-    codex)
-      # Codex: extract last item.completed with agent_message type
-      # agent_message items have a flat .item.text field (not a content array)
-      local codex_output
-      codex_output=$(grep '"type":"item.completed"' "$events_file" 2>/dev/null \
-        | grep '"agent_message"' \
-        | tail -1 \
-        | jq -r '.item.text // "no output"' 2>/dev/null || true)
-      echo "${codex_output:-no output}" > "$run_dir/output.md"
-      ;;
-  esac
+  DRIVER_RESULT_JSON=$(cd "$REPO_ROOT" && printf "%s" "$prompt" | python3 -m runner.host invoke \
+    --driver "$PAK_DRIVER" \
+    --model "$_driver_model" \
+    --run-dir "$run_dir") || die "driver invocation failed"
+  AGENT_STATUS=$(echo "$DRIVER_RESULT_JSON" | jq -r '.status')
 }
 
-# ── cost extraction ────────────────────────────────────────────────────────────
-#
-# extract_cost <events_file>
-#   Sets: input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-#
-extract_cost() {
-  local events_file="$1"
-  case "$PAK_DRIVER" in
-    claude)
-      local result_event
-      result_event=$(grep '"type":"result"' "$events_file" 2>/dev/null | tail -1 || true)
-      input_tokens=$(echo "$result_event" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo 0)
-      output_tokens=$(echo "$result_event" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo 0)
-      cache_read=$(echo "$result_event" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || echo 0)
-      cache_write=$(echo "$result_event" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || echo 0)
-      cost_usd=$(echo "$result_event" | jq -r '.total_cost_usd // 0' 2>/dev/null || echo 0)
-      num_turns=$(echo "$result_event" | jq -r '.num_turns // "null"' 2>/dev/null || echo null)
-      duration_ms=$(echo "$result_event" | jq -r '.duration_ms // "null"' 2>/dev/null || echo null)
-      ;;
-    codex)
-      # Sum usage across turn.completed events; no cache_write or cost_usd fields
-      input_tokens=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
-        | jq -s '[.[].usage.input_tokens // 0] | add // 0' 2>/dev/null || echo 0)
-      output_tokens=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
-        | jq -s '[.[].usage.output_tokens // 0] | add // 0' 2>/dev/null || echo 0)
-      cache_read=$(grep '"type":"turn.completed"' "$events_file" 2>/dev/null \
-        | jq -s '[.[].usage.cached_input_tokens // 0] | add // 0' 2>/dev/null || echo 0)
-      cache_write=0
-      cost_usd=0
-      num_turns=$(grep -c '"type":"turn.completed"' "$events_file" 2>/dev/null || echo 0)
-      duration_ms=null
-      ;;
-  esac
+persist_driver_result_to_meta() {
+  local meta="$1"
+  local run_dir="$2"
+  local driver_result_json="$3"
+  local completed_at
+  completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
+  [[ -n "$completed_at" ]] || completed_at=$(iso_now)
+
+  local outputs='[]'
+  [[ -f "$run_dir/reflection.md" ]] && outputs='["reflection.md"]'
+  jq \
+    --arg completed     "$completed_at" \
+    --argjson driver_result "$driver_result_json" \
+    --argjson outputs   "$outputs" \
+    '.completed_at = (if (.completed_at | type) == "string" and .completed_at != "" then .completed_at else $completed end)
+   | .status      = $driver_result.status
+   | .cost        = $driver_result.cost
+   | .num_turns   = $driver_result.num_turns
+   | .duration_ms = $driver_result.duration_ms
+   | .outputs     = $outputs
+   | del(.zombie_cleaned_at, .zombie_note)' \
+    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
 }
 
 # ── subcommands ───────────────────────────────────────────────────────────────
 
 cmd_run() {
-  local goal_file="${1:-}"
-  [[ -n "$goal_file" ]] || die "usage: personalagentkit run <goal-file>"
+  local goal_file="" explicit_driver="" explicit_model=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --driver) [[ -n "${2:-}" ]] || die "--driver requires a value"; explicit_driver="$2"; shift 2 ;;
+      --model)  [[ -n "${2:-}" ]] || die "--model requires a value"; explicit_model="$2"; shift 2 ;;
+      --*)      die "unknown flag: $1" ;;
+      *)
+        [[ -z "$goal_file" ]] || die "usage: personalagentkit run [--driver <name>] [--model <name>] <goal-file>"
+        goal_file="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$goal_file" ]] || die "usage: personalagentkit run [--driver <name>] [--model <name>] <goal-file>"
   [[ -f "$REPO_ROOT/$goal_file" ]] || die "goal file not found: $goal_file"
 
+  resolve_goal_routing "$REPO_ROOT/$goal_file" "$explicit_driver" "$explicit_model"
+  require python3
   require "$_driver_bin"
   require jq
 
   local goal_id
   goal_id=$(goal_id_from_file "$goal_file")
 
-  local run_dir="$REPO_ROOT/runs/$goal_id"
+  local assigned_to
+  assigned_to=$(parse_goal_meta "$REPO_ROOT/$goal_file" assigned_to)
+
+  local base_dir run_dir
+  if [[ -n "$assigned_to" ]]; then
+    base_dir="$REPO_ROOT/plants/$assigned_to"
+    mkdir -p "$base_dir/goals" "$base_dir/runs" "$base_dir/memory"
+    [[ -f "$base_dir/MOTIVATION.md" ]] || cp "$REPO_ROOT/MOTIVATION.md" "$base_dir/MOTIVATION.md" 2>/dev/null || true
+    run_dir="$base_dir/runs/$goal_id"
+  else
+    base_dir="$REPO_ROOT"
+    run_dir="$REPO_ROOT/runs/$goal_id"
+  fi
   mkdir -p "$run_dir"
 
   local meta="$run_dir/meta.json"
-  local output="$run_dir/output.md"
   local started_at
   started_at=$(iso_now)
 
@@ -280,6 +323,8 @@ cmd_run() {
     --arg run_id       "$goal_id" \
     --arg goal_file    "$goal_file" \
     --arg started      "$started_at" \
+    --arg driver       "$PAK_DRIVER" \
+    --arg model        "$_driver_model" \
     --arg agent        "${_driver_model:-$PAK_DRIVER}" \
     --arg submitted_by "$submitted_by" \
     '{
@@ -288,6 +333,8 @@ cmd_run() {
       started_at: $started,
       completed_at: null,
       status:     "running",
+      driver:     $driver,
+      model:      $model,
       agent:      $agent,
       cost:       null,
       outputs:    [],
@@ -299,14 +346,14 @@ cmd_run() {
 
   # ── build the prompt ──────────────────────────────────────────────────────
   local motivation
-  motivation=$(cat "$REPO_ROOT/MOTIVATION.md")
+  motivation=$(cat "$base_dir/MOTIVATION.md")
   local goal_content
   goal_content=$(cat "$REPO_ROOT/$goal_file")
 
   local memory_section=""
-  if [[ -f "$REPO_ROOT/memory/MEMORY.md" ]]; then
+  if [[ -f "$base_dir/memory/MEMORY.md" ]]; then
     local memory_content
-    memory_content=$(cat "$REPO_ROOT/memory/MEMORY.md")
+    memory_content=$(cat "$base_dir/memory/MEMORY.md")
     memory_section=$(cat <<MEMORY
 
 ---
@@ -335,48 +382,18 @@ $goal_content
 
 ---
 
-Your working directory is $REPO_ROOT. Begin.
+Your working directory is $base_dir. Begin.
 PROMPT
 )
 
   # ── invoke agent, stream events to events.jsonl ───────────────────────────
   invoke_agent "$run_dir" "$prompt"
+  local driver_result_json="$DRIVER_RESULT_JSON"
   local status="$AGENT_STATUS"
 
+  persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
   local completed_at
-  completed_at=$(iso_now)
-
-  # ── extract cost from stream events (P6: cost is always visible) ─────────
-  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  extract_cost "$run_dir/events.jsonl"
-
-  # ── update meta.json with completion data ─────────────────────────────────
-  local outputs='["output.md"]'
-  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
-  jq \
-    --arg completed     "$completed_at" \
-    --arg status        "$status" \
-    --argjson input     "$input_tokens" \
-    --argjson output    "$output_tokens" \
-    --argjson cread     "$cache_read" \
-    --argjson cwrite    "$cache_write" \
-    --arg cost          "$cost_usd" \
-    --argjson turns     "$num_turns" \
-    --argjson dur       "$duration_ms" \
-    --argjson outputs   "$outputs" \
-    '.completed_at = $completed
-   | .status      = $status
-   | .cost        = {
-       input_tokens:        $input,
-       output_tokens:       $output,
-       cache_read_tokens:   $cread,
-       cache_write_tokens:  $cwrite,
-       actual_usd:          ($cost | tonumber)
-     }
-   | .num_turns   = $turns
-   | .duration_ms = $dur
-   | .outputs     = $outputs' \
-    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+  completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
 
   # ── validate meta.json (P2: schema is a contract, not documentation) ──────
   local validation_errors
@@ -389,7 +406,13 @@ PROMPT
       (if (.completed_at | type) != "string"  then "completed_at: missing or not a string"    else empty end),
       (if (.status == "killed") then empty elif (.num_turns   | type) != "number" then "num_turns: missing or not an integer"   else empty end),
       (if (.status == "killed") then empty elif (.duration_ms | type) != "number" then "duration_ms: missing or not an integer" else empty end),
-      (if ((.cost.actual_usd | type) != "number") then "cost.actual_usd: missing or not a number" else empty end)
+      (if ((.cost | type) != "object") then "cost: missing or not an object"
+       elif (((.cost.actual_usd | type) == "number") or ((.cost.estimated_usd | type) == "number")) then empty
+       elif (.cost.pricing.notes | type) == "string" then empty
+       else "cost: requires actual_usd, estimated_usd, or pricing.notes explaining why neither is available" end),
+      (if ((.cost.estimated_usd | type) == "number") and ((.cost.pricing.source // "") != "local-estimate") then "cost.pricing.source: estimated cost requires local-estimate" else empty end),
+      (if ((.cost.estimated_usd | type) == "number") and ((.cost.pricing.version | type) != "string") then "cost.pricing.version: estimated cost requires a pricing version" else empty end),
+      (if ((.cost.estimated_usd | type) == "number") and ((.cost.pricing.retrieved_at | type) != "string") then "cost.pricing.retrieved_at: estimated cost requires retrieved_at" else empty end)
     ] | .[]
   ' "$meta" 2>/dev/null || true)
 
@@ -405,8 +428,8 @@ PROMPT
   fi
 
   echo "personalagentkit: run $goal_id completed ($status) at $completed_at"
-  echo "personalagentkit: cost = \$$cost_usd USD"
-  echo "personalagentkit: output → $run_dir/output.md"
+  echo "personalagentkit: cost = $(preferred_cost_from_meta "$meta") USD"
+  echo "personalagentkit: response → $run_dir/_stdout.md"
 
   # ── auto-commit run directory (P8: git history is the system's memory) ────
   (
@@ -494,6 +517,7 @@ cmd_status() {
     turns=$(jq -r '.num_turns // "null"' "$meta" 2>/dev/null)
     dur_ms=$(jq -r '.duration_ms // "null"' "$meta" 2>/dev/null)
     status_raw=$(jq -r '.status // "null"' "$meta" 2>/dev/null)
+    [[ "$status_raw" != "null" ]] && status_raw=$(normalize_status "$status_raw")
     started_at=$(jq -r '.started_at // "null"' "$meta" 2>/dev/null)
 
     # prefix plant runs with plant name for clarity
@@ -541,6 +565,8 @@ cmd_status() {
 
     printf "%-36s  %-10s  %-10s  %-6s  %s\n" "$display_id" "$status_fmt" "$cost_fmt" "$turns_fmt" "$dur_fmt"
   done
+
+  printf "\n%s\n" "$(legacy_status_summary)"
 }
 
 cmd_plant() {
@@ -549,6 +575,8 @@ cmd_plant() {
   [[ -n "$seed_name" ]]  || die "usage: personalagentkit plant <seed-name> <plant-name>"
   [[ -n "$plant_name" ]] || die "usage: personalagentkit plant <seed-name> <plant-name>"
 
+  resolve_driver_config "$PAK_DEFAULT_DRIVER" "$PAK_DEFAULT_MODEL"
+  require python3
   require "$_driver_bin"
   require jq
 
@@ -567,7 +595,7 @@ cmd_plant() {
 
   local run_dir="$plant_dir/runs/000-genesis"
   local meta="$run_dir/meta.json"
-  local output="$run_dir/output.md"
+  local output="$run_dir/_stdout.md"
   local started_at
   started_at=$(iso_now)
 
@@ -579,6 +607,8 @@ cmd_plant() {
     --arg run_id    "000-genesis" \
     --arg goal_file "goals/000-genesis.md" \
     --arg started   "$started_at" \
+    --arg driver    "$PAK_DRIVER" \
+    --arg model     "$_driver_model" \
     --arg agent     "${_driver_model:-$PAK_DRIVER}" \
     '{
       run_id:     $run_id,
@@ -586,6 +616,8 @@ cmd_plant() {
       started_at: $started,
       completed_at: null,
       status:     "running",
+      driver:     $driver,
+      model:      $model,
       agent:      $agent,
       cost:       null,
       outputs:    [],
@@ -620,47 +652,19 @@ PROMPT
 
   # ── invoke agent, stream events to events.jsonl ───────────────────────────
   invoke_agent "$run_dir" "$prompt"
+  local driver_result_json="$DRIVER_RESULT_JSON"
   local status="$AGENT_STATUS"
 
+  persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
   local completed_at
-  completed_at=$(iso_now)
-
-  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  extract_cost "$run_dir/events.jsonl"
-
-  local outputs='["output.md"]'
-  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
-  jq \
-    --arg completed     "$completed_at" \
-    --arg status        "$status" \
-    --argjson input     "$input_tokens" \
-    --argjson output    "$output_tokens" \
-    --argjson cread     "$cache_read" \
-    --argjson cwrite    "$cache_write" \
-    --arg cost          "$cost_usd" \
-    --argjson turns     "$num_turns" \
-    --argjson dur       "$duration_ms" \
-    --argjson outputs   "$outputs" \
-    '.completed_at = $completed
-   | .status      = $status
-   | .cost        = {
-       input_tokens:        $input,
-       output_tokens:       $output,
-       cache_read_tokens:   $cread,
-       cache_write_tokens:  $cwrite,
-       actual_usd:          ($cost | tonumber)
-     }
-   | .num_turns   = $turns
-   | .duration_ms = $dur
-   | .outputs     = $outputs' \
-    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
+  completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
 
   if [[ ! -f "$run_dir/reflection.md" ]]; then
     echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
   fi
 
   echo "personalagentkit: genesis run completed ($status) at $completed_at"
-  echo "personalagentkit: cost = \$$cost_usd USD"
+  echo "personalagentkit: cost = $(preferred_cost_from_meta "$meta") USD"
   echo "personalagentkit: plant $plant_name is alive → $plant_dir"
 
   # ── auto-commit run directory (P8: git history is the system's memory) ────
@@ -674,176 +678,26 @@ PROMPT
 }
 
 cmd_plant_run() {
-  local plant_name="${1:-}"
-  local goal_rel="${2:-}"
-  [[ -n "$plant_name" ]]  || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
-  [[ -n "$goal_rel" ]]    || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
-
-  require "$_driver_bin"
-  require jq
-
-  local plant_dir="$REPO_ROOT/plants/$plant_name"
-  [[ -d "$plant_dir" ]] || die "plant not found: $plant_dir"
-
-  local goal_file="$plant_dir/$goal_rel"
-  # fall back to repo-root-relative path (supports unified queue where goals live in root goals/)
-  [[ -f "$goal_file" ]] || goal_file="$REPO_ROOT/$goal_rel"
-  [[ -f "$goal_file" ]] || die "goal file not found: $goal_rel (checked plant dir and repo root)"
-
-  local goal_id
-  goal_id=$(goal_id_from_file "$goal_rel")
-
-  local run_dir="$plant_dir/runs/$goal_id"
-  mkdir -p "$run_dir"
-
-  local meta="$run_dir/meta.json"
-  local output="$run_dir/output.md"
-  local started_at
-  started_at=$(iso_now)
-
-  # ── write initial run record (P5) ─────────────────────────────────────────
-  local submitted_by="${TELOS_SUBMITTED_BY:-}"
-  jq -n \
-    --arg run_id       "$goal_id" \
-    --arg goal_file    "$goal_rel" \
-    --arg started      "$started_at" \
-    --arg agent        "${_driver_model:-$PAK_DRIVER}" \
-    --arg submitted_by "$submitted_by" \
-    '{
-      run_id:     $run_id,
-      goal_file:  $goal_file,
-      started_at: $started,
-      completed_at: null,
-      status:     "running",
-      agent:      $agent,
-      cost:       null,
-      outputs:    [],
-      notes:      null
-    } | if $submitted_by != "" then . + {submitted_by: $submitted_by} else . end' > "$meta"
-
-  echo "personalagentkit: plant-run $plant_name/$goal_id started at $started_at"
-  echo "personalagentkit: record → $meta"
-
-  # ── build the prompt ──────────────────────────────────────────────────────
-  local motivation
-  motivation=$(cat "$plant_dir/MOTIVATION.md")
-  local goal_content
-  goal_content=$(cat "$goal_file")
-
-  local memory_section=""
-  if [[ -f "$plant_dir/memory/MEMORY.md" ]]; then
-    local memory_content
-    memory_content=$(cat "$plant_dir/memory/MEMORY.md")
-    memory_section=$(cat <<MEMORY
-
----
-
-# Memory
-
-$memory_content
-MEMORY
-)
-  fi
-
-  local prompt
-  prompt=$(cat <<PROMPT
-You are a capable agent working on a goal within the PersonalAgentKit system.
-
-# Motivation
-
-$motivation
-$memory_section
-
----
-
-# Goal
-
-$goal_content
-
----
-
-Your working directory is $plant_dir. Begin.
-PROMPT
-)
-
-  # ── invoke agent, stream events to events.jsonl ───────────────────────────
-  invoke_agent "$run_dir" "$prompt"
-  local status="$AGENT_STATUS"
-
-  local completed_at
-  completed_at=$(iso_now)
-
-  local input_tokens output_tokens cache_read cache_write cost_usd num_turns duration_ms
-  extract_cost "$run_dir/events.jsonl"
-
-  local outputs='["output.md"]'
-  [[ -f "$run_dir/reflection.md" ]] && outputs='["output.md", "reflection.md"]'
-  jq \
-    --arg completed     "$completed_at" \
-    --arg status        "$status" \
-    --argjson input     "$input_tokens" \
-    --argjson output    "$output_tokens" \
-    --argjson cread     "$cache_read" \
-    --argjson cwrite    "$cache_write" \
-    --arg cost          "$cost_usd" \
-    --argjson turns     "$num_turns" \
-    --argjson dur       "$duration_ms" \
-    --argjson outputs   "$outputs" \
-    '.completed_at = $completed
-   | .status      = $status
-   | .cost        = {
-       input_tokens:        $input,
-       output_tokens:       $output,
-       cache_read_tokens:   $cread,
-       cache_write_tokens:  $cwrite,
-       actual_usd:          ($cost | tonumber)
-     }
-   | .num_turns   = $turns
-   | .duration_ms = $dur
-   | .outputs     = $outputs' \
-    "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
-
-  # ── validate meta.json ────────────────────────────────────────────────────
-  local validation_errors
-  validation_errors=$(jq -r '
-    [
-      (if (.run_id       | type) != "string"  then "run_id: missing or not a string"         else empty end),
-      (if (.goal_file    | type) != "string"  then "goal_file: missing or not a string"       else empty end),
-      (if (.started_at   | type) != "string"  then "started_at: missing or not a string"      else empty end),
-      (if (.status       | type) != "string"  then "status: missing or not a string"          else empty end),
-      (if (.completed_at | type) != "string"  then "completed_at: missing or not a string"    else empty end),
-      (if (.status == "killed") then empty elif (.num_turns   | type) != "number" then "num_turns: missing or not an integer"   else empty end),
-      (if (.status == "killed") then empty elif (.duration_ms | type) != "number" then "duration_ms: missing or not an integer" else empty end),
-      (if ((.cost.actual_usd | type) != "number") then "cost.actual_usd: missing or not a number" else empty end)
-    ] | .[]
-  ' "$meta" 2>/dev/null || true)
-
-  if [[ -n "$validation_errors" ]]; then
-    echo "personalagentkit: WARNING: meta.json validation failed for $goal_id:" >&2
-    while IFS= read -r line; do
-      echo "  - $line" >&2
-    done <<< "$validation_errors"
-  fi
-
-  if [[ ! -f "$run_dir/reflection.md" ]]; then
-    echo "personalagentkit: WARNING: reflection.md missing from $run_dir" >&2
-  fi
-
-  echo "personalagentkit: plant-run $plant_name/$goal_id completed ($status) at $completed_at"
-  echo "personalagentkit: cost = \$$cost_usd USD"
-  echo "personalagentkit: output → $output"
-
-  # ── auto-commit run directory (P8: git history is the system's memory) ────
-  (
-    flock -x 200
-    git -C "$REPO_ROOT" add "$run_dir" "$goal_file" 2>/dev/null
-    git -C "$REPO_ROOT" add -A 2>/dev/null
-    if git -C "$REPO_ROOT" commit -m "run $goal_id: finalize" 2>/dev/null; then
-      echo "personalagentkit: committed run $goal_id"
-    else
-      echo "personalagentkit: WARNING: auto-commit failed for $goal_id" >&2
-    fi
-  ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
+  # Deprecated: plant routing is now handled via assigned_to: frontmatter in the goal file.
+  # This shim strips the plant-name argument and delegates to cmd_run.
+  local plant_name="" goal_rel="" passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --driver|--model) passthrough+=("$1" "${2:-}"); shift 2 ;;
+      --*)      die "unknown flag: $1" ;;
+      *)        if [[ -z "$plant_name" ]]; then
+          plant_name="$1"
+        elif [[ -z "$goal_rel" ]]; then
+          goal_rel="$1"
+        else
+          die "usage: personalagentkit plant-run [--driver <name>] [--model <name>] <plant-name> <goal-file>"
+        fi
+        shift ;;
+    esac
+  done
+  [[ -n "$plant_name" ]] || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
+  [[ -n "$goal_rel" ]]   || die "usage: personalagentkit plant-run <plant-name> <goal-file>"
+  cmd_run "${passthrough[@]}" "$goal_rel"
 }
 
 cmd_garden() {
@@ -879,6 +733,7 @@ cmd_garden() {
       turns=$(jq -r '.num_turns // "null"' "$meta" 2>/dev/null)
       dur_ms=$(jq -r '.duration_ms // "null"' "$meta" 2>/dev/null)
       status_raw=$(jq -r '.status // "null"' "$meta" 2>/dev/null)
+      [[ "$status_raw" != "null" ]] && status_raw=$(normalize_status "$status_raw")
 
       cost_fmt=$(   [[ "$cost_raw"   == "null" ]] && echo "-" || printf '$%.4f' "$cost_raw")
       turns_fmt=$(  [[ "$turns"      == "null" ]] && echo "-" || echo "$turns")
@@ -945,12 +800,12 @@ Note the trigger from frontmatter (`trigger:` field) — include it in your summ
 
 Run these from the personalagentkit root:
 - `./scripts/personalagentkit status` — all runs, costs, turns, duration
-- `python3 report` — cost trends and summary stats
+- `python3 scripts/report` — cost trends and summary stats
 - `ls inbox/` — any messages waiting for reply?
 
 For each plant:
 - Read `plants/<name>/memory/MEMORY.md`
-- Read its most recent run's `meta.json`, `output.md`, `reflection.md`
+- Read its most recent run's `meta.json`, `_stdout.md`, `reflection.md`
 - Check for `plants/<name>/capability-gap-*.md` — named gap files identify
   specific missing capabilities (e.g., `capability-gap-sms-receipt.md`).
   Commission gap-closing goals as needed. Goals that `requires:` a gapped
@@ -999,11 +854,10 @@ reflections about reflections creates a closed loop that produces no value.
 ## Produce outputs
 
 Every tend run:
-1. Print a short summary (10–20 lines) to stdout — captured as `output.md`
+1. Print a short summary (10–20 lines) to stdout — the runner captures it automatically
 2. Write `reflection.md` to the run directory — what did tending reveal?
 3. Update `memory/MEMORY.md` if this tend revealed durable insights
 
-Do NOT write to `output.md` using the Write tool.
 Do NOT make a terminal commit — the runner's auto-commit captures everything.
 TEND
 
@@ -1092,7 +946,7 @@ or update memory. Focus on observation, analysis, and shared knowledge.
 - Do NOT write goals — that's what tends do
 - Do NOT update plant memory or root memory — observe only
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
-- Do NOT write to `output.md` via the Write tool — print to stdout
+- Print to stdout — the runner captures it automatically
 - Read broadly: the value of a retrospective is seeing what individual tends miss
 RETRO
 
@@ -1120,6 +974,8 @@ cmd_regenesis() {
   local seed_path="$REPO_ROOT/seeds/${seed_name}.md"
   [[ -f "$seed_path" ]] || die "seed not found: seeds/${seed_name}.md"
 
+  resolve_driver_config "$PAK_DEFAULT_DRIVER" "$PAK_DEFAULT_MODEL"
+  require python3
   require "$_driver_bin"
   require jq
 
@@ -1160,7 +1016,7 @@ assigned_to: $plant_name
 Your seed has been updated. Integrate the changes into your memory without
 losing your accumulated knowledge or identity.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything
-- Do NOT write to \`output.md\` via the Write tool
+- Print to stdout — the runner captures it automatically
 
 ## Current seed content
 
@@ -1527,17 +1383,7 @@ cmd_cycle_legacy() {
     # step 5: classify goal type and check for repetition loop
     local goal_slug goal_type
     goal_slug=$(basename "$best_goal_rel" .md)
-    case "$goal_slug" in
-      *integrate-*)                                        goal_type="integrate" ;;
-      *retrospective*)                                     goal_type="retrospective" ;;
-      *tend*)                                              goal_type="tend" ;;
-      *genesis*)                                           goal_type="genesis" ;;
-      *dispatch-*)                                         goal_type="dispatch" ;;
-      *review-*)                                           goal_type="review" ;;
-      *spike-*|*-spike)                                    goal_type="spike" ;;
-      *fix-*|*fix_*)                                       goal_type="fix" ;;
-      *)                                                   goal_type="build" ;;
-    esac
+    goal_type=$(classify_goal_type "$goal_slug")
 
     if [[ "$goal_type" == "$last_goal_type" ]]; then
       consecutive_type_count=$(( consecutive_type_count + 1 ))
@@ -1625,7 +1471,7 @@ goal stubs that the next cycle can execute.
    - Find the next available NNN by scanning `goals/` and `runs/`
    - Write `goals/NNN-<slug>.md` with a brief goal description
    - These become real goals the cycle will pick up and run
-6. Print a short summary to stdout (becomes output.md). Include which goal stubs were written.
+6. Print a short summary to stdout — include which goal stubs were written.
 
 ## Definition of done
 
@@ -1640,7 +1486,7 @@ goal stubs that the next cycle can execute.
 - Don't write a stub for "do another retrospective" — that happens automatically
 - **Do NOT make a terminal commit** with a message like `run {id}: finalize`. The runner
   commits everything after you exit. Use descriptive intermediate commits only.
-- **Do NOT write to `output.md` via the Write tool.** Print your summary to stdout.
+- Print your summary to stdout — the runner captures it automatically.
 RETRO
 
   echo "telos: running post-cycle retrospective → $retro_file"
@@ -1648,7 +1494,7 @@ RETRO
 }
 
 cmd_submit() {
-  local plant_name="" depends_on="" submitted_by="${TELOS_SUBMITTED_BY:-}" priority="" goal_file=""
+  local plant_name="" depends_on="" submitted_by="${TELOS_SUBMITTED_BY:-}" priority="" driver="" model="" goal_file=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1656,11 +1502,13 @@ cmd_submit() {
       --depends-on)   depends_on="$2";    shift 2 ;;
       --submitted-by) submitted_by="$2";  shift 2 ;;
       --priority)     priority="$2";      shift 2 ;;
+      --driver)       driver="$2";        shift 2 ;;
+      --model)        model="$2";         shift 2 ;;
       *)              goal_file="$1";     shift ;;
     esac
   done
 
-  [[ -n "$goal_file" ]] || die "usage: personalagentkit submit [--plant <name>] [--depends-on <slug,...>] <goal-file>"
+  [[ -n "$goal_file" ]] || die "usage: personalagentkit submit [--plant <name>] [--depends-on <slug,...>] [--driver <name>] [--model <name>] <goal-file>"
   [[ -f "$goal_file" ]] || die "goal file not found: $goal_file"
 
   if [[ -n "$plant_name" ]]; then
@@ -1693,7 +1541,7 @@ cmd_submit() {
   local dest="$REPO_ROOT/goals/${goal_num}-${goal_slug}.md"
 
   # Extract body and existing frontmatter from source file
-  local body first_line src_assigned="" src_depends="" src_submitted="" src_priority=""
+  local body first_line src_assigned="" src_depends="" src_submitted="" src_priority="" src_driver="" src_model=""
   first_line=$(head -1 "$goal_file")
   if [[ "$first_line" == "---" ]]; then
     # Parse existing frontmatter values
@@ -1703,6 +1551,8 @@ cmd_submit() {
     src_depends=$(echo "$fm_block"   | grep '^depends_on:'   | head -1 | cut -d: -f2- | xargs || true)
     src_submitted=$(echo "$fm_block" | grep '^submitted_by:' | head -1 | cut -d: -f2- | xargs || true)
     src_priority=$(echo "$fm_block"  | grep '^priority:'     | head -1 | cut -d: -f2- | xargs || true)
+    src_driver=$(echo "$fm_block"    | grep '^driver:'       | head -1 | cut -d: -f2- | xargs || true)
+    src_model=$(echo "$fm_block"     | grep '^model:'        | head -1 | cut -d: -f2- | xargs || true)
     body=$(awk 'BEGIN{f=0} /^---$/{f++; if(f==2){found=1; next}} found{print}' "$goal_file")
   else
     body=$(cat "$goal_file")
@@ -1713,18 +1563,22 @@ cmd_submit() {
   [[ -n "$depends_on" ]]   && src_depends="[$depends_on]"
   [[ -n "$submitted_by" ]] && src_submitted="$submitted_by"
   [[ -n "$priority" ]]     && src_priority="$priority"
+  [[ -n "$driver" ]]       && src_driver="$driver"
+  [[ -n "$model" ]]        && src_model="$model"
 
   # Normalize depends_on format
   [[ -n "$src_depends" ]] && src_depends=$(echo "$src_depends" | sed 's/^\[//;s/\]$//')
 
   # Write destination file with merged frontmatter
   {
-    if [[ -n "$src_assigned" || -n "$src_depends" || -n "$src_submitted" || -n "$src_priority" ]]; then
+    if [[ -n "$src_assigned" || -n "$src_depends" || -n "$src_submitted" || -n "$src_priority" || -n "$src_driver" || -n "$src_model" ]]; then
       echo "---"
       [[ -n "$src_assigned" ]]  && echo "assigned_to: $src_assigned"
       [[ -n "$src_depends" ]]   && echo "depends_on: [$src_depends]"
       [[ -n "$src_submitted" ]] && echo "submitted_by: $src_submitted"
       [[ -n "$src_priority" ]]  && echo "priority: $src_priority"
+      [[ -n "$src_driver" ]]    && echo "driver: $src_driver"
+      [[ -n "$src_model" ]]     && echo "model: $src_model"
       echo "---"
     fi
     echo "$body"
@@ -1774,10 +1628,11 @@ cmd_await() {
     if [[ -n "$meta" ]]; then
       local status
       status=$(jq -r '.status // ""' "$meta" 2>/dev/null)
+      status=$(normalize_status "$status")
       if [[ "$status" == "success" ]]; then
         echo "telos: await $goal_id → success"
         return 0
-      elif [[ "$status" == "failure" || "$status" == "killed" ]]; then
+      elif is_terminal_status "$status"; then
         echo "telos: await $goal_id → $status"
         return 1
       fi
@@ -1919,19 +1774,21 @@ cmd_help() {
 personalagentkit — minimal goal runner
 
 Commands:
-  run <goal-file>            Run a goal, record what happened
+  run [--driver D] [--model M] <goal-file>
+                             Run a goal, record what happened
   status                     Show in-flight runs at top, then all root run records
   watch                      Live-updating table of in-flight runs (ctrl-c to stop)
   plant <seed> <name>        Create a new plant from a seed and run its genesis goal
-  plant-run <name> <goal>    Run a subsequent goal within a plant (injects plant memory)
+  plant-run [--driver D] [--model M] <name> <goal>
+                             Run a subsequent goal within a plant (injects plant memory)
   garden                     Show the state of all plants
   tend                       Write a tend goal for head-gardener and run it
   retrospective              Write a retrospective goal for gardener and run it
   regenesis <plant> [seed]   Re-inject updated seed into a plant's memory
-  submit [--plant <name>] [--depends-on <slug,...>] [--priority N] <goal-file>
+  submit [--plant <name>] [--depends-on <slug,...>] [--priority N] [--driver D] [--model M] <goal-file>
                              Write a goal to goals/ with frontmatter; exits immediately
   await <goal-id> [--timeout <seconds>]
-                             Poll until a goal run reaches success, failure, or killed (default: 300s)
+                             Poll until a goal run reaches a terminal status: success, failure, killed, or abandoned (default: 300s)
   cycle [--workers N] [--tend-interval SECONDS] [--retro-interval SECONDS] [--max-cost <dollars>] [--fg]
                              Concurrent dispatcher: auto-launches in tmux (use --fg to stay in foreground)
   priority <goal-id> <N>     Set priority (lower = sooner; default 5)
@@ -1943,22 +1800,27 @@ Commands:
   help                       Show this message
 
 Run records (runs/NNN-slug/):
-  meta.json       Structured run record; status is one of: running | success | failure | killed
+  meta.json       Structured run record; status is one of: running | success | failure | killed | abandoned
   events.jsonl    NDJSON stream of claude events (tail -f while running for live view)
-  output.md       Final agent text output extracted from the result event
+  _stdout.md       Final agent text output extracted from the result event
   stderr.txt      stderr from the claude process
 
   status: killed  Set when the 60-second no-event watchdog fires; partial cost data preserved
+  legacy read-compat: completed->success, failed->failure; new runs write only canonical statuses
 
 Goal frontmatter (optional YAML block at top of goal file):
   ---
   assigned_to: first-coder    # route to a plant (must match plants/<name>)
   depends_on: [003-build-x]   # wait until these goal slugs have a successful run
+                               # or use 003-build-x:done|success|failure|killed|abandoned
   priority: 5                 # 1=urgent, 10=someday, default 5 (lower runs sooner)
+  driver: codex               # optional per-goal driver override
+  model: codex-mini-latest    # optional per-goal model override
   ---
 
 Examples:
   ./personalagentkit run goals/002-something.md
+  ./personalagentkit run goals/002-something.md --driver codex --model codex-mini-latest
   ./personalagentkit status
   ./personalagentkit watch
   ./personalagentkit plant coder first-coder
@@ -1966,7 +1828,7 @@ Examples:
   ./personalagentkit garden
   ./personalagentkit tend
   ./personalagentkit submit --plant first-coder /tmp/my-goal.md
-  ./personalagentkit submit --plant explorer --depends-on 012-build-lib --priority 3 /tmp/spike.md
+  ./personalagentkit submit --plant explorer --depends-on 012-build-lib --priority 3 --driver codex --model gpt-5.4 /tmp/spike.md
   ./personalagentkit await 013-my-goal
   ./personalagentkit await 013-my-goal --timeout 600
   ./personalagentkit cycle

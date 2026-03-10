@@ -38,7 +38,7 @@ You have just come online. Build your foundation:
    that requires 20+ checks per run is bureaucracy, not quality assurance.
 
 3. **Review something real** — look at recent runs in the entity's git history.
-   Pick one completed `build`, `fix`, or `spike` run. Read its `output.md`,
+   Pick one completed `build`, `fix`, or `spike` run. Read its `_stdout.md`,
    `meta.json`, and `reflection.md`. Write a brief review in
    `runs/001-genesis/review.md`. Apply your rubric. Be honest.
 
@@ -118,6 +118,5 @@ for this run, put it in reflection.md. If future-you needs it, put it in memory.
 - Do not soften assessments to avoid discomfort — that's not useful
 - Your memory is yours — write it honestly
 - This is a genesis run: one real review is worth more than three theoretical ones
-- Do NOT write to `output.md` via the Write tool. The runner extracts your
-  stdout automatically.
+- Print to stdout — the runner captures it automatically.
 - Do NOT make a terminal commit — the runner's auto-commit captures everything.
