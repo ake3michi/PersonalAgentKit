@@ -206,6 +206,59 @@ legacy_status_summary() {
   echo "Legacy compatibility: reading completed->success and failed->failure for older records. Present in current run records: ${unique}."
 }
 
+operator_first_name_from_charter() {
+  local charter="$REPO_ROOT/../shared/charter.md"
+  [[ -f "$charter" ]] || return 0
+
+  awk '
+    /^## Operator[[:space:]]*$/ { in_operator=1; next }
+    /^## / && in_operator { exit }
+    in_operator && NF { print; exit }
+  ' "$charter" \
+    | head -1 \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/^[^a-z0-9-]*//; s/[^a-z0-9-].*$//'
+}
+
+is_operator_outbox_file() {
+  local file_name
+  file_name=$(basename "$1")
+  [[ "$file_name" =~ ^[0-9]+-to-operator\.md$ ]] && return 0
+
+  local operator_first_name
+  operator_first_name=$(operator_first_name_from_charter)
+  [[ -n "$operator_first_name" ]] || return 1
+  [[ "$file_name" =~ ^[0-9]+-to-${operator_first_name}\.md$ ]]
+}
+
+surface_pending_operator_mail() {
+  local prefix="${1:-telos}"
+  local inbox_dir="$REPO_ROOT/inbox"
+  [[ -d "$inbox_dir" ]] || return 0
+
+  local any_pending=false
+  local msg
+  shopt -s nullglob
+  for msg in "$inbox_dir"/*.md; do
+    is_operator_outbox_file "$msg" || continue
+    local base nnn reply
+    base=$(basename "$msg" .md)
+    nnn=$(echo "$base" | grep -oE '^[0-9]+' | head -1)
+    reply="$inbox_dir/${nnn}-reply.md"
+    if [[ ! -f "$reply" ]]; then
+      if [[ "$any_pending" == "false" ]]; then
+        echo "$prefix: ── inbox ────────────────────────────────────────────────"
+        any_pending=true
+      fi
+      echo "$prefix: pending: $msg"
+      echo "---"
+      cat "$msg"
+      echo "---"
+    fi
+  done
+  shopt -u nullglob
+}
+
 # ── driver config ─────────────────────────────────────────────────────────────
 
 PAK_DEFAULT_DRIVER="${PAK_DRIVER:-$(cat "$REPO_ROOT/.personalagentkit-driver" 2>/dev/null || echo claude)}"
@@ -1135,6 +1188,8 @@ cmd_status() {
   done
 
   printf "\n%s\n" "$(legacy_status_summary)"
+  printf "\n"
+  surface_pending_operator_mail "personalagentkit"
 
   printf "\nHEALTH\n"
   (
@@ -1779,27 +1834,7 @@ cmd_cycle_legacy() {
   echo "telos: cycle starting (max_iterations=$max_iter, tend_every=$tend_every$cost_msg)"
 
   # surface any pending inbox messages before the cycle begins
-  if [[ -d "$REPO_ROOT/inbox" ]]; then
-    local any_pending=false
-    for msg in "$REPO_ROOT/inbox"/*-to-operator.md; do
-      [[ -f "$msg" ]] || continue
-      local base nnn reply
-      base=$(basename "$msg" .md)
-      nnn=$(echo "$base" | grep -oE '^[0-9]+' | head -1)
-      reply="$REPO_ROOT/inbox/${nnn}-reply.md"
-      if [[ ! -f "$reply" ]]; then
-        if [[ "$any_pending" == "false" ]]; then
-          echo "telos: ── inbox ────────────────────────────────────────────────"
-          any_pending=true
-        fi
-        echo "telos: pending: $msg"
-        echo "---"
-        cat "$msg"
-        echo "---"
-      fi
-    done
-    [[ "$any_pending" == "true" ]] && echo "telos: ────────────────────────────────────────────────────────"
-  fi
+  surface_pending_operator_mail "telos"
 
   while true; do
     # step 1: tend (gardener assesses, may write new goals) — only when due

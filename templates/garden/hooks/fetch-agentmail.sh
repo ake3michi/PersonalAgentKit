@@ -45,6 +45,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+OPERATOR_OUTBOX_RE = re.compile(r"^(?P<nnn>\d{3,})-to-(?P<recipient>[a-z0-9-]+)\.md$")
+
 
 def slugify(value: str) -> str:
     lowered = value.strip().lower()
@@ -78,6 +80,143 @@ def next_nnn(inbox_dir: Path) -> int:
         if match:
             highest = max(highest, int(match.group(1)))
     return highest + 1
+
+
+def split_frontmatter(text: str) -> tuple[dict[str, object], str]:
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+
+    parsed: dict[str, object] = {}
+    for raw_line in parts[1].splitlines():
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if not value:
+            parsed[key.strip()] = ""
+            continue
+        try:
+            parsed[key.strip()] = json.loads(value)
+        except Exception:
+            parsed[key.strip()] = value.strip('"')
+    return parsed, parts[2].lstrip("\n")
+
+
+def operator_identity(repo_root: Path) -> tuple[str, str]:
+    charter = repo_root.parent / "shared" / "charter.md"
+    if not charter.exists():
+        return "", ""
+
+    first_name = ""
+    email = ""
+    in_operator = False
+    for raw_line in charter.read_text().splitlines():
+        line = raw_line.strip()
+        if raw_line.startswith("## "):
+            if line == "## Operator":
+                in_operator = True
+                continue
+            if in_operator:
+                break
+        if not in_operator or not line:
+            continue
+        if not first_name:
+            token = re.split(r"[^a-z0-9-]+", line.lower(), maxsplit=1)[0]
+            first_name = token
+            continue
+        if line.lower().startswith("email:"):
+            email = line.split(":", 1)[1].strip().lower()
+            break
+    return first_name, email
+
+
+def pending_operator_outbox(repo_root: Path) -> list[Path]:
+    inbox_dir = repo_root / "inbox"
+    if not inbox_dir.is_dir():
+        return []
+
+    first_name, _ = operator_identity(repo_root)
+    aliases = {"operator"}
+    if first_name:
+        aliases.add(first_name)
+
+    pending: list[Path] = []
+    for path in sorted(inbox_dir.glob("*.md")):
+        match = OPERATOR_OUTBOX_RE.match(path.name)
+        if match is None or match.group("recipient") not in aliases:
+            continue
+        reply = inbox_dir / f"{match.group('nnn')}-reply.md"
+        if not reply.exists():
+            pending.append(path)
+    return pending
+
+
+def sender_is_operator(repo_root: Path, sender: str) -> bool:
+    first_name, email = operator_identity(repo_root)
+    lowered = sender.lower()
+    if email and email in lowered:
+        return True
+    if first_name and first_name in lowered:
+        return True
+    return False
+
+
+def matching_sent_thread_records(inbox_dir: Path, thread_id: str) -> list[tuple[Path, str]]:
+    matches: list[tuple[Path, str]] = []
+    for path in sorted(inbox_dir.glob("*.md")):
+        try:
+            frontmatter, body = split_frontmatter(path.read_text())
+        except Exception:
+            continue
+        labels = frontmatter.get("labels")
+        if not isinstance(labels, list) or "sent" not in labels:
+            continue
+        if frontmatter.get("thread_id") != thread_id:
+            continue
+        matches.append((path, body.rstrip()))
+    return matches
+
+
+def map_reply_target(repo_root: Path, sender: str, labels: list[object], thread_id: str) -> str | None:
+    if "sent" in labels or not sender_is_operator(repo_root, sender):
+        return None
+
+    pending = pending_operator_outbox(repo_root)
+    if not pending:
+        return None
+
+    inbox_dir = repo_root / "inbox"
+    if thread_id:
+        sent_records = matching_sent_thread_records(inbox_dir, thread_id)
+        if sent_records:
+            pending_by_body: dict[str, list[Path]] = {}
+            for path in pending:
+                try:
+                    pending_by_body.setdefault(path.read_text().rstrip(), []).append(path)
+                except Exception:
+                    continue
+            matched_paths: list[Path] = []
+            for _, sent_body in sent_records:
+                matched_paths.extend(pending_by_body.get(sent_body, []))
+            unique = {path for path in matched_paths}
+            if len(unique) == 1:
+                match = next(iter(unique))
+                nnn = match.name.split("-", 1)[0]
+                reply = inbox_dir / f"{nnn}-reply.md"
+                if not reply.exists():
+                    return nnn
+                return None
+
+    if len(pending) == 1:
+        nnn = pending[0].name.split("-", 1)[0]
+        reply = inbox_dir / f"{nnn}-reply.md"
+        if not reply.exists():
+            return nnn
+    return None
 
 
 def request_json(url: str, api_key: str) -> dict:
@@ -151,6 +290,7 @@ for message in sorted(messages, key=lambda item: item.get("created_at", "")):
     subject = str(detail.get("subject") or message.get("subject") or "")
     created_at = str(detail.get("created_at") or message.get("created_at") or "")
     labels = detail.get("labels") or message.get("labels") or []
+    thread_id = str(detail.get("thread_id") or message.get("thread_id") or "")
     body = (
         detail.get("text")
         or detail.get("body_text")
@@ -161,7 +301,11 @@ for message in sorted(messages, key=lambda item: item.get("created_at", "")):
     if not isinstance(body, str):
         body = json.dumps(body, indent=2)
 
-    filename = f"{counter:03d}-from-{slugify(sender)}.md"
+    reply_target = map_reply_target(repo_root, sender, labels, thread_id)
+    if reply_target:
+        filename = f"{reply_target}-reply.md"
+    else:
+        filename = f"{counter:03d}-from-{slugify(sender)}.md"
     content = "\n".join(
         [
             "---",
@@ -170,6 +314,7 @@ for message in sorted(messages, key=lambda item: item.get("created_at", "")):
             f"subject: {json.dumps(subject)}",
             f"created_at: {json.dumps(created_at)}",
             f"labels: {json.dumps(labels)}",
+            f"thread_id: {json.dumps(thread_id)}",
             'source: "agentmail"',
             "---",
             "",
@@ -180,7 +325,8 @@ for message in sorted(messages, key=lambda item: item.get("created_at", "")):
     (inbox_dir / filename).write_text(content)
     print(f"fetch-agentmail: wrote {filename}")
     known_ids.add(message_id)
-    counter += 1
+    if not reply_target:
+        counter += 1
     new_count += 1
 
 sys.exit(1 if new_count else 0)

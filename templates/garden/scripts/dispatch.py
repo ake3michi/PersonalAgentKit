@@ -34,12 +34,64 @@ STATUS_ALIASES = {
     "failed": "failure",
 }
 TERMINAL_STATUSES = {"success", "failure", "killed", "abandoned"}
+OPERATOR_OUTBOX_RE = re.compile(r"^(?P<nnn>\d+)-to-(?P<recipient>[a-z0-9][a-z0-9-]*)\.md$")
 
 
 def normalize_run_status(status: Optional[str]) -> Optional[str]:
     if status is None:
         return None
     return STATUS_ALIASES.get(status, status)
+
+
+def operator_first_name(repo_root: Path) -> str | None:
+    charter_path = repo_root.parent / "shared" / "charter.md"
+    if not charter_path.is_file():
+        return None
+
+    try:
+        lines = charter_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    in_operator_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## Operator":
+            in_operator_section = True
+            continue
+        if in_operator_section and stripped.startswith("## "):
+            break
+        if not in_operator_section or not stripped:
+            continue
+        first_token = stripped.split()[0].strip().lower()
+        normalized = re.sub(r"[^a-z0-9-]", "", first_token)
+        return normalized or None
+    return None
+
+
+def operator_outbox_aliases(repo_root: Path) -> set[str]:
+    aliases = {"operator"}
+    first_name = operator_first_name(repo_root)
+    if first_name:
+        aliases.add(first_name)
+    return aliases
+
+
+def pending_operator_messages(repo_root: Path) -> list[Path]:
+    inbox = repo_root / "inbox"
+    if not inbox.is_dir():
+        return []
+
+    aliases = operator_outbox_aliases(repo_root)
+    pending: list[Path] = []
+    for msg in sorted(inbox.glob("*.md")):
+        match = OPERATOR_OUTBOX_RE.match(msg.name)
+        if match is None or match.group("recipient") not in aliases:
+            continue
+        reply = inbox / f"{match.group('nnn')}-reply.md"
+        if not reply.exists():
+            pending.append(msg)
+    return pending
 
 
 def parse_frontmatter(text: str) -> dict[str, object]:
@@ -149,6 +201,7 @@ class Dispatcher:
         self.lock = threading.Lock()
         self.active_slots = 0
         self.in_progress: set[str] = set()
+        self.active_plant_runs: dict[str, set[str]] = {}
         self.cycle_cost: float = 0.0
         self.slot_freed = threading.Event()
         self.quiet_event = threading.Event()
@@ -204,6 +257,7 @@ class Dispatcher:
                             f"personalagentkit: startup scan: found live run {run_id}, treating as active",
                             flush=True,
                         )
+                        self._mark_plant_active_locked(plant_name, run_id)
                         if plant_name == "gardener":
                             self.gardener_running = True
                             self._startup_gardener_run_id = run_id
@@ -219,6 +273,21 @@ class Dispatcher:
                             t.start()
                     except Exception:
                         pass
+
+    def _mark_plant_active_locked(self, plant: str, run_id: str) -> None:
+        if not plant:
+            return
+        self.active_plant_runs.setdefault(plant, set()).add(run_id)
+
+    def _mark_plant_inactive_locked(self, plant: str, run_id: str) -> None:
+        if not plant:
+            return
+        run_ids = self.active_plant_runs.get(plant)
+        if not run_ids:
+            return
+        run_ids.discard(run_id)
+        if not run_ids:
+            self.active_plant_runs.pop(plant, None)
 
     # ── sentinel helpers ──────────────────────────────────────────────────────
 
@@ -369,6 +438,12 @@ class Dispatcher:
             if self._has_run(nnn, plant=assigned_to):
                 continue
 
+            if assigned_to:
+                plant_busy, _ = self._plant_has_active_run(assigned_to)
+                if plant_busy:
+                    blocked += 1
+                    continue
+
             # Check not_before time gate
             if not_before_raw:
                 try:
@@ -435,21 +510,7 @@ class Dispatcher:
     # ── inbox surfacing ───────────────────────────────────────────────────────
 
     def _surface_inbox(self):
-        inbox = self.repo_root / "inbox"
-        if not inbox.is_dir():
-            return
-        pending = []
-        for msg in sorted(inbox.glob("*-to-operator.md")):
-            base = msg.stem
-            nnn = ""
-            for ch in base:
-                if ch.isdigit():
-                    nnn += ch
-                else:
-                    break
-            reply = inbox / f"{nnn}-reply.md"
-            if not reply.exists():
-                pending.append(msg)
+        pending = pending_operator_messages(self.repo_root)
         if pending:
             print("personalagentkit: ── inbox ────────────────────────────────────────────────", flush=True)
             for msg in pending:
@@ -667,6 +728,14 @@ class Dispatcher:
 
         return active_run_ids
 
+    def _plant_has_active_run(self, plant: str) -> tuple[bool, str]:
+        with self.lock:
+            in_memory = sorted(self.active_plant_runs.get(plant, set()))
+        if in_memory:
+            return True, in_memory[-1]
+
+        return self._plant_has_running_run(plant)
+
     def _plant_has_running_run(self, plant: str) -> tuple[bool, str]:
         """Check if a plant already has an active run by reading meta.json files.
 
@@ -841,6 +910,7 @@ class Dispatcher:
             with self.lock:
                 self.active_slots -= 1
                 self.in_progress.discard(goal_rel)
+                self._mark_plant_inactive_locked(assigned_to, Path(goal_rel).stem)
                 self._recent_completions += 1
             self.slot_freed.set()
 
@@ -857,6 +927,7 @@ class Dispatcher:
                     with self.lock:
                         self.active_slots -= 1
                         self.in_progress.discard(goal_rel)
+                        self._mark_plant_inactive_locked(plant_name, run_id)
                     self.slot_freed.set()
                     print(
                         f"personalagentkit: startup-restored run {run_id} ({plant_name})"
@@ -950,6 +1021,7 @@ class Dispatcher:
                     if normalize_run_status(data.get("status")) not in (None, "running"):
                         with self.lock:
                             self.gardener_running = False
+                            self._mark_plant_inactive_locked("gardener", startup_run_id)
                         self._startup_gardener_run_id = None
                         print(
                             f"personalagentkit: startup-restored gardener run {startup_run_id}"
@@ -1084,11 +1156,14 @@ class Dispatcher:
                     break
                 if entry.goal_rel in self.in_progress:
                     continue
+                if entry.assigned_to and self.active_plant_runs.get(entry.assigned_to):
+                    continue
                 # Check cost cap
                 if self.max_cost is not None and self.cycle_cost >= self.max_cost:
                     break
                 self.active_slots += 1
                 self.in_progress.add(entry.goal_rel)
+                self._mark_plant_active_locked(entry.assigned_to, Path(entry.goal_rel).stem)
             t = threading.Thread(target=self._worker, args=(entry,), daemon=True)
             t.start()
             launched += 1

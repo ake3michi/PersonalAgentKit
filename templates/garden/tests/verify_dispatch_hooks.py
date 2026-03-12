@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import json
+import contextlib
 import copy
 import importlib.util
+import io
+import json
 import os
 import shutil
 import stat
@@ -39,6 +41,10 @@ def scaffold_repo(tmp_root: Path):
     shutil.copy2(REPO_ROOT / "scripts" / "dispatch.py", tmp_root / "scripts" / "dispatch.py")
     shutil.copy2(REPO_ROOT / "schema" / "run.schema.json", tmp_root / "schema" / "run.schema.json")
     shutil.copytree(REPO_ROOT / "runner", tmp_root / "runner", dirs_exist_ok=True)
+    write_file(
+        tmp_root.parent / "shared" / "charter.md",
+        "# Charter\n\n## Operator\n\nGabriel Example\nEmail: operator@example.com\n",
+    )
 
 
 def scaffold_agentmail_repo(tmp_root: Path):
@@ -139,6 +145,7 @@ class AgentmailHandler(BaseHTTPRequestHandler):
                 "subject": "Shared inbox test",
                 "preview": "shared preview",
                 "labels": ["inbox"],
+                "thread_id": "thread-shared",
                 "created_at": "2026-03-10T00:10:00Z",
             }
         ]
@@ -149,6 +156,7 @@ class AgentmailHandler(BaseHTTPRequestHandler):
                 "subject": "Shared inbox test",
                 "text": "shared detail",
                 "labels": ["inbox"],
+                "thread_id": "thread-shared",
                 "created_at": "2026-03-10T00:10:00Z",
             }
         }
@@ -209,6 +217,7 @@ class AgentmailServer(ThreadingHTTPServer):
                         "subject": "Override test",
                         "preview": "override preview",
                         "labels": ["inbox"],
+                        "thread_id": "thread-override",
                         "created_at": "2026-03-10T00:05:00Z",
                     }
                 ],
@@ -221,6 +230,7 @@ class AgentmailServer(ThreadingHTTPServer):
                         "subject": "Override test",
                         "text": "override detail",
                         "labels": ["inbox"],
+                        "thread_id": "thread-override",
                         "created_at": "2026-03-10T00:05:00Z",
                     }
                 },
@@ -533,6 +543,125 @@ fi
             assert "config/agentmail.env" in hook_result.stderr
             assert not (repo_root / "config" / "agentmail.env").exists()
             assert_equal(sorted((repo_root / "inbox").glob("*.md")), [], "manual-config inert path should not write inbox files")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            scaffold_agentmail_repo(repo_root)
+            write_file(repo_root / "secrets" / "agentmail-api-key.txt", "test-key\n")
+            write_file(repo_root / "memory" / "MEMORY.md", "I am Cipher.\n")
+            write_file(repo_root / "inbox" / "001-to-gabriel.md", "Question for Gabriel\n")
+            saved_state = copy.deepcopy(agentmail_server.state)
+            agentmail_server.state["inboxes"] = [
+                {
+                    "inbox_id": "pak-shared@agentmail.to",
+                    "display_name": "AgentMail",
+                    "created_at": "2026-03-10T00:00:00Z",
+                    "updated_at": "2026-03-10T00:00:00Z",
+                    "client_id": "personalagentkit-shared-inbox-v1",
+                }
+            ]
+            agentmail_server.state["messages"]["pak-shared@agentmail.to"] = [
+                {
+                    "message_id": "<sent-message@example.com>",
+                    "from": "PersonalAgentKit Shared Inbox <pak-shared@agentmail.to>",
+                    "subject": "[coordinator] Question",
+                    "preview": "Question for Gabriel",
+                    "labels": ["sent"],
+                    "thread_id": "thread-reply",
+                    "created_at": "2026-03-10T00:10:00Z",
+                },
+                {
+                    "message_id": "<reply-message@example.com>",
+                    "from": "Gabriel Example <operator@example.com>",
+                    "subject": "Re: [coordinator] Question",
+                    "preview": "Real reply body",
+                    "labels": ["inbox"],
+                    "thread_id": "thread-reply",
+                    "created_at": "2026-03-10T00:11:00Z",
+                },
+                {
+                    "message_id": "<unrelated-message@example.com>",
+                    "from": "Another Person <another@example.com>",
+                    "subject": "Unrelated inbound",
+                    "preview": "Unrelated note",
+                    "labels": ["inbox"],
+                    "thread_id": "thread-other",
+                    "created_at": "2026-03-10T00:12:00Z",
+                },
+            ]
+            agentmail_server.state["details"]["pak-shared@agentmail.to"] = {
+                "<sent-message@example.com>": {
+                    "message_id": "<sent-message@example.com>",
+                    "from": "PersonalAgentKit Shared Inbox <pak-shared@agentmail.to>",
+                    "subject": "[coordinator] Question",
+                    "text": "Question for Gabriel\n",
+                    "labels": ["sent"],
+                    "thread_id": "thread-reply",
+                    "created_at": "2026-03-10T00:10:00Z",
+                },
+                "<reply-message@example.com>": {
+                    "message_id": "<reply-message@example.com>",
+                    "from": "Gabriel Example <operator@example.com>",
+                    "subject": "Re: [coordinator] Question",
+                    "text": "Real reply body\n",
+                    "labels": ["inbox"],
+                    "thread_id": "thread-reply",
+                    "created_at": "2026-03-10T00:11:00Z",
+                },
+                "<unrelated-message@example.com>": {
+                    "message_id": "<unrelated-message@example.com>",
+                    "from": "Another Person <another@example.com>",
+                    "subject": "Unrelated inbound",
+                    "text": "Unrelated note\n",
+                    "labels": ["inbox"],
+                    "thread_id": "thread-other",
+                    "created_at": "2026-03-10T00:12:00Z",
+                },
+            }
+
+            try:
+                hook_result = run_cmd(
+                    [str(repo_root / "hooks" / "fetch-agentmail.sh")],
+                    cwd=repo_root,
+                    env={"AGENTMAIL_BASE_URL": agentmail_base_url},
+                )
+            finally:
+                agentmail_server.state.clear()
+                agentmail_server.state.update(saved_state)
+            assert_equal(
+                hook_result.returncode,
+                1,
+                "fetch-agentmail should archive operator replies as NNN-reply and preserve unrelated inbound mail",
+            )
+            reply_file = repo_root / "inbox" / "001-reply.md"
+            assert reply_file.exists(), "real operator replies should map back to the pending operator outbox entry"
+            reply_text = reply_file.read_text()
+            assert "message_id: \"<reply-message@example.com>\"" in reply_text
+            assert "thread_id: \"thread-reply\"" in reply_text
+            assert "Real reply body" in reply_text
+            inbox_files = sorted(path.name for path in (repo_root / "inbox").glob("*.md"))
+            assert_equal(
+                inbox_files,
+                [
+                    "001-reply.md",
+                    "001-to-gabriel.md",
+                    "002-from-personalagentkit-shared-inbox-pak-shared-agentmail-to.md",
+                    "003-from-another-person-another-example-com.md",
+                ],
+                "reply normalization should clear the pending thread without changing generic archiving for other inbound mail",
+            )
+            dispatcher = dispatch.Dispatcher(
+                repo_root=repo_root,
+                max_workers=1,
+                tend_interval=30,
+                max_cost=None,
+                retro_interval=3600,
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                dispatcher._surface_inbox()
+            if "001-to-gabriel.md" in buf.getvalue():
+                raise AssertionError("dispatcher tend surfacing should stop showing pending operator mail once reply exists")
 
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
