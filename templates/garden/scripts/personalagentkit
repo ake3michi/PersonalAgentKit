@@ -236,6 +236,187 @@ goal_id_from_file() {
   basename "$1" .md
 }
 
+goal_title_from_file() {
+  local goal_file="$1"
+  awk '
+    /^#/ {
+      sub(/^#[[:space:]]*/, "", $0)
+      print
+      exit
+    }
+  ' "$goal_file" 2>/dev/null || true
+}
+
+goal_run_pointer_path() {
+  local goal_file="$1"
+  printf '%s\n' "${goal_file%.md}.run"
+}
+
+expected_run_dir_for_goal() {
+  local goal_file="$1"
+  local goal_id assigned_to
+  goal_id=$(goal_id_from_file "$goal_file")
+  assigned_to=$(parse_goal_meta "$goal_file" assigned_to)
+
+  if [[ -n "$assigned_to" ]]; then
+    printf 'plants/%s/runs/%s\n' "$assigned_to" "$goal_id"
+  else
+    printf 'runs/%s\n' "$goal_id"
+  fi
+}
+
+latest_agent_message() {
+  local run_dir="$1"
+  local events_file="$run_dir/events.jsonl"
+  [[ -f "$events_file" ]] || return 0
+
+  jq -r -s '
+    map(select(.type == "item.completed" and (.item.type // "") == "agent_message"))
+    | last
+    | .item.text // empty
+  ' "$events_file" 2>/dev/null \
+    | tr '\n' ' ' \
+    | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+run_reader_artifacts() {
+  local run_dir="$1"
+  local found=false
+  local artifact base
+
+  shopt -s nullglob
+  for artifact in "$run_dir"/*.md "$run_dir"/_stdout.md; do
+    [[ -f "$artifact" ]] || continue
+    base=$(basename "$artifact")
+    case "$base" in
+      README.md|prompt-attempt-*.md) continue ;;
+    esac
+    printf '%s\n' "$base"
+    found=true
+  done
+  shopt -u nullglob
+
+  [[ "$found" == "true" ]] || true
+}
+
+write_goal_run_pointer() {
+  local goal_file="$1"
+  local goal_path="$REPO_ROOT/$goal_file"
+  [[ -f "$goal_path" ]] || return 0
+
+  local pointer_path run_dir_rel run_dir_abs status goal_title assigned_to
+  pointer_path=$(goal_run_pointer_path "$goal_path")
+  run_dir_rel=$(expected_run_dir_for_goal "$goal_path")
+  run_dir_abs="$REPO_ROOT/$run_dir_rel"
+  goal_title=$(goal_title_from_file "$goal_path")
+  assigned_to=$(parse_goal_meta "$goal_path" assigned_to)
+
+  if [[ -f "$run_dir_abs/meta.json" ]]; then
+    status=$(jq -r '.status // "running"' "$run_dir_abs/meta.json" 2>/dev/null)
+    status=$(normalize_status "$status")
+  else
+    status="queued"
+  fi
+
+  {
+    echo "# Run Pointer"
+    echo
+    [[ -n "$goal_title" ]] && echo "- Goal: $goal_title"
+    echo "- Goal file: \`$goal_file\`"
+    if [[ -n "$assigned_to" ]]; then
+      echo "- Assigned plant: \`$assigned_to\`"
+    else
+      echo "- Assigned plant: root"
+    fi
+    echo "- Status: \`$status\`"
+    echo "- Run directory: \`$run_dir_rel\`"
+    echo "- Open first when the run exists: \`$run_dir_rel/README.md\`"
+    if [[ "$status" == "queued" ]]; then
+      echo "- Queue contract: this pointer is the reader-facing state file until the run directory exists."
+    else
+      echo "- Reader contract: once execution starts, the run directory's \`README.md\` is the authoritative first file to open."
+    fi
+  } > "$pointer_path"
+}
+
+write_run_readme() {
+  local run_dir="$1"
+  local meta="$run_dir/meta.json"
+  [[ -f "$meta" ]] || return 0
+
+  local run_id goal_file status started_at completed_at goal_type requires_reflection goal_title
+  run_id=$(jq -r '.run_id // ""' "$meta" 2>/dev/null)
+  goal_file=$(jq -r '.goal_file // ""' "$meta" 2>/dev/null)
+  status=$(jq -r '.status // "unknown"' "$meta" 2>/dev/null)
+  status=$(normalize_status "$status")
+  started_at=$(jq -r '.started_at // ""' "$meta" 2>/dev/null)
+  completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
+  goal_type=$(jq -r '.goal_type // empty' "$meta" 2>/dev/null)
+  requires_reflection=$(jq -r '.requires_reflection // false' "$meta" 2>/dev/null)
+  goal_title=$(goal_title_from_file "$REPO_ROOT/$goal_file")
+
+  local latest_progress
+  latest_progress=$(latest_agent_message "$run_dir")
+
+  local cost_value artifact_lines
+  cost_value=$(preferred_cost_from_meta "$meta")
+  artifact_lines=$(run_reader_artifacts "$run_dir" | sort || true)
+
+  {
+    echo "# Run Overview"
+    echo
+    [[ -n "$goal_title" ]] && echo "- Goal: $goal_title"
+    echo "- Run id: \`$run_id\`"
+    [[ -n "$goal_file" ]] && echo "- Goal file: \`$goal_file\`"
+    echo "- Status: \`$status\`"
+    [[ -n "$goal_type" ]] && echo "- Goal type: \`$goal_type\`"
+    [[ -n "$started_at" ]] && echo "- Started: \`$started_at\`"
+    [[ -n "$completed_at" ]] && echo "- Completed: \`$completed_at\`"
+    if [[ "$cost_value" != "null" ]]; then
+      echo "- Cost: \`$cost_value\` USD"
+    fi
+    echo
+    echo "Open this file first. The JSON and JSONL files in this directory remain the supporting evidence."
+    echo
+    if [[ "$status" == "running" ]]; then
+      echo "## Current State"
+      if [[ -n "$latest_progress" ]]; then
+        echo
+        echo "$latest_progress"
+      else
+        echo
+        echo "No agent message has been recorded yet."
+      fi
+      echo
+      echo "Expected guaranteed artifacts on completion:"
+      echo "- \`_stdout.md\` for the run summary"
+      if [[ "$requires_reflection" == "true" ]]; then
+        echo "- \`reflection.md\` because this run's reflection contract requires it on success"
+      fi
+    else
+      echo "## What To Read Next"
+      if [[ -n "$artifact_lines" ]]; then
+        printf '%s\n' "$artifact_lines" | while IFS= read -r artifact; do
+          [[ -n "$artifact" ]] || continue
+          echo "- \`$artifact\`"
+        done
+      else
+        echo "- No reader-facing markdown artifacts are present beyond this file yet."
+      fi
+    fi
+    echo
+    echo "## Evidence Files"
+    echo "- \`meta.json\` for structured status, timing, and cost"
+    echo "- \`events.jsonl\` for the raw event transcript"
+    if [[ -f "$run_dir/checkpoint.jsonl" ]]; then
+      echo "- \`checkpoint.jsonl\` for lifecycle checkpoints"
+    fi
+    if [[ -f "$run_dir/stderr.txt" ]]; then
+      echo "- \`stderr.txt\` for driver stderr"
+    fi
+  } > "$run_dir/README.md"
+}
+
 classify_goal_type() {
   local slug="${1:-}"
   slug=$(basename "$slug" .md)
@@ -756,6 +937,9 @@ cmd_run() {
       notes:      null
     } | if $submitted_by != "" then . + {submitted_by: $submitted_by} else . end' > "$meta"
 
+  write_goal_run_pointer "$goal_file"
+  write_run_readme "$run_dir"
+
   echo "personalagentkit: run $goal_id started at $started_at"
   echo "personalagentkit: record → $meta"
 
@@ -772,6 +956,8 @@ cmd_run() {
   local status="$AGENT_STATUS"
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_goal_run_pointer "$goal_file"
+  write_run_readme "$run_dir"
   local completed_at
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
 
@@ -1041,6 +1227,9 @@ cmd_plant() {
       notes:      null
     }' > "$meta"
 
+  write_goal_run_pointer "$genesis_goal_file"
+  write_run_readme "$run_dir"
+
   # ── build the prompt and write prompt artifact ────────────────────────────
   local attempt prompt
   attempt=$(next_attempt_number "$run_dir")
@@ -1054,6 +1243,8 @@ cmd_plant() {
   local status="$AGENT_STATUS"
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_goal_run_pointer "$genesis_goal_file"
+  write_run_readme "$run_dir"
   local completed_at
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
 
@@ -1259,6 +1450,7 @@ Every tend run:
 Do NOT make a terminal commit — the runner's auto-commit captures everything.
 TEND
 
+  write_goal_run_pointer "$goal_file"
   echo "personalagentkit: wrote tend goal → $goal_path"
   cmd_plant_run "$gardener" "$goal_file"
 }
@@ -1350,6 +1542,7 @@ RETRO
   # Patch the hardcoded knowledge path to match this installation
   sed -i "s|../shared/knowledge|${shared_knowledge}|g" "$goal_path"
 
+  write_goal_run_pointer "$goal_file"
   echo "personalagentkit: wrote retrospective goal → $goal_path"
   cmd_plant_run "$gardener" "$goal_file"
 }
@@ -1422,6 +1615,7 @@ $seed_content
 \`\`\`
 REGENESIS
 
+  write_goal_run_pointer "$goal_file"
   echo "telos: wrote regenesis goal → $goal_path"
   cmd_plant_run "$plant_name" "$goal_file"
 }
@@ -1985,6 +2179,7 @@ cmd_submit() {
     git -C "$REPO_ROOT" commit -m "goal: ${goal_num}-${goal_slug}" 2>/dev/null || true
   ) 200>"$REPO_ROOT/.personalagentkit-git.lock"
 
+  write_goal_run_pointer "goals/${goal_num}-${goal_slug}.md"
   echo "submitted: goals/${goal_num}-${goal_slug}.md"
 }
 
@@ -2281,6 +2476,7 @@ cmd_resume_run() {
   archive_dir=$(archive_attempt_artifacts "$run_dir" "$prior_attempt")
   resumed_at=$(iso_now)
   reset_meta_for_resume "$meta" "$resumed_at" "$prior_attempt"
+  write_run_readme "$run_dir"
 
   attempt=$(next_attempt_number "$run_dir")
   prompt=$(build_run_prompt \
@@ -2297,6 +2493,7 @@ cmd_resume_run() {
   local completed_at
 
   persist_driver_result_to_meta "$meta" "$run_dir" "$driver_result_json"
+  write_run_readme "$run_dir"
   completed_at=$(jq -r '.completed_at // empty' "$meta" 2>/dev/null)
   write_resume_artifact "$run_dir" "$prior_attempt" "$archive_dir"
 
