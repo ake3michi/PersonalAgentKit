@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 from runner.plugin_api import DriverConfig
+from runner.transcript_support import build_unrendered_event_entry, normalize_todo_items
 
 
 CODEX_PRICING_VERSION = "openai-api-pricing-2026-03-09"
@@ -87,6 +89,72 @@ class CodexDriver:
             "num_turns": len(turn_events),
             "duration_ms": duration_ms,
         }
+
+    def normalize_transcript(self, *, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rendered: list[dict[str, Any]] = []
+        todo_snapshots: dict[str, str] = {}
+
+        for index, event in enumerate(events):
+            matched = False
+            event_type = event.get("type")
+            item = event.get("item")
+
+            if event_type == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+                rendered.append(
+                    {
+                        "order": index,
+                        "kind": "assistant_message",
+                        "text": str(item.get("text") or ""),
+                    }
+                )
+                matched = True
+
+            if event_type == "item.completed" and isinstance(item, dict) and item.get("type") == "command_execution":
+                rendered.append(
+                    {
+                        "order": index,
+                        "kind": "tool_activity",
+                        "tool_name": "command_execution",
+                        "status": str(item.get("status") or "unknown"),
+                        "exit_code": item.get("exit_code"),
+                        "invocation": str(item.get("command") or ""),
+                        "result_text": str(item.get("aggregated_output") or ""),
+                        "result_label": "aggregated_output",
+                    }
+                )
+                matched = True
+
+            if event_type == "item.completed" and isinstance(item, dict) and item.get("type") == "file_change":
+                rendered.append(
+                    {
+                        "order": index,
+                        "kind": "file_change",
+                        "changes": item.get("changes") if isinstance(item.get("changes"), list) else [],
+                    }
+                )
+                matched = True
+
+            if event_type in {"item.started", "item.updated", "item.completed"} and isinstance(item, dict) and item.get("type") == "todo_list":
+                todo_id = str(item.get("id") or f"todo-{index}")
+                todo_items = normalize_todo_items(item.get("items"))
+                snapshot = json.dumps(todo_items, sort_keys=True)
+                if todo_snapshots.get(todo_id) == snapshot:
+                    matched = True
+                else:
+                    todo_snapshots[todo_id] = snapshot
+                    rendered.append(
+                        {
+                            "order": index,
+                            "kind": "todo_list",
+                            "items": todo_items,
+                        }
+                    )
+                    matched = True
+
+            if not matched:
+                rendered.append(build_unrendered_event_entry(order=index, event=event))
+
+        return rendered
 
 
 PLUGIN = CodexDriver()

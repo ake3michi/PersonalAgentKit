@@ -55,6 +55,7 @@ def create_fake_driver(plugin_dir: Path, driver_bin: Path):
 from typing import Any, Mapping
 
 from runner.plugin_api import DriverConfig
+from runner.drivers.codex_driver import CodexDriver
 
 
 class FakeDriver:
@@ -89,6 +90,9 @@ class FakeDriver:
             "duration_ms": 1000,
         }
 
+    def normalize_transcript(self, *, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return CodexDriver().normalize_transcript(events=events)
+
 
 PLUGIN = FakeDriver()
 """.replace("__BIN__", str(driver_bin))
@@ -97,7 +101,11 @@ import json
 import sys
 
 _ = sys.stdin.read()
+print(json.dumps({"type": "item.started", "item": {"id": "todo1", "type": "todo_list", "items": [{"text": "Inspect reader artifacts", "completed": False}, {"text": "Write transcript", "completed": False}]}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "msg1", "type": "agent_message", "text": "Working on the reader contract."}}))
+print(json.dumps({"type": "item.completed", "item": {"id": "cmd1", "type": "command_execution", "command": "/bin/bash -lc 'printf \\"hello\\\\nworld\\\\n\\"'", "aggregated_output": "hello\\nworld\\n", "exit_code": 0, "status": "completed"}}))
+print(json.dumps({"type": "item.completed", "item": {"id": "change1", "type": "file_change", "changes": [{"path": "/tmp/demo.txt", "kind": "update"}], "status": "completed"}}))
+print(json.dumps({"type": "item.updated", "item": {"id": "todo1", "type": "todo_list", "items": [{"text": "Inspect reader artifacts", "completed": True}, {"text": "Write transcript", "completed": True}]}}))
 print(json.dumps({"type": "item.completed", "item": {"id": "msg2", "type": "agent_message", "text": "Reader contract finished."}}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}, "duration_ms": 1000}))
 sys.stdout.flush()
@@ -134,6 +142,7 @@ Write a short summary to stdout.
             "PAK_DRIVER_PLUGIN_PATH": str(repo_root / "plugins"),
             "PAK_DRIVER": "fake",
             "PAK_MODEL": "fake-model",
+            "PAK_ALLOW_NESTED_RUN": "1",
         }
 
         subprocess.run(
@@ -171,13 +180,29 @@ Write a short summary to stdout.
 
         run_dir = repo_root / "plants" / "worker" / "runs" / "001-reader-contract"
         readme_text = (run_dir / "README.md").read_text(encoding="utf-8")
+        transcript_text = (run_dir / "transcript.md").read_text(encoding="utf-8")
         pointer_text = pointer_file.read_text(encoding="utf-8")
 
         assert_contains(pointer_text, "Status: `success`", "run pointer should update once the run completes")
         assert_contains(readme_text, "Status: `success`", "run README should show the terminal status")
         assert_contains(readme_text, "Goal file: `goals/001-reader-contract.md`", "run README should link back to the goal")
         assert_contains(readme_text, "`_stdout.md`", "run README should point readers to the summary artifact")
+        assert_contains(readme_text, "`transcript.md`", "run README should list the transcript artifact")
         assert_contains(readme_text, "`meta.json`", "run README should preserve the evidence path")
+        assert readme_text.count("- `_stdout.md`") == 1, "run README should list _stdout.md only once"
+        assert (run_dir / "transcript.md").exists(), "terminal runs should generate transcript.md"
+        assert_contains(transcript_text, "README.md` remains the first reader entry", "transcript should preserve reader hierarchy")
+        assert_contains(transcript_text, "`events.jsonl` remains the raw evidence source", "transcript should preserve evidence hierarchy")
+        assert_contains(transcript_text, "## Assistant Message", "transcript should render assistant messages")
+        assert_contains(transcript_text, "## Tool Activity", "transcript should render tool activity")
+        assert_contains(transcript_text, "- Tool: `command_execution`", "codex command executions should normalize as tool activity")
+        assert_contains(transcript_text, "/bin/bash -lc 'printf", "transcript should keep command metadata")
+        assert_contains(transcript_text, "Output summary (from `aggregated_output`)", "transcript should label command output as a summary")
+        assert_contains(transcript_text, "## File Change", "transcript should render file changes")
+        assert_contains(transcript_text, "/tmp/demo.txt", "transcript should include changed file paths")
+        assert transcript_text.count("## Todo List Update") == 2, "transcript should render only changed todo snapshots"
+        assert_contains(transcript_text, "## Unrendered Event", "transcript should surface unsupported raw events")
+        assert_contains(transcript_text, "- Raw event type: `turn.completed`", "placeholder should identify the raw event type")
 
         assert goal_file.exists()
         assert pointer_file.exists()

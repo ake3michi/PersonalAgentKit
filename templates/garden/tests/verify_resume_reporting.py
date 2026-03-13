@@ -108,6 +108,9 @@ class FakeDriver:
             "duration_ms": duration_ms,
         }
 
+    def normalize_transcript(self, *, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return []
+
 
 PLUGIN = FakeDriver()
 """
@@ -194,6 +197,7 @@ def verify_cumulative_resume_reporting():
             "PAK_DRIVER_PLUGIN_PATH": str(repo_root / "plugins"),
             "PAK_DRIVER": "fake",
             "PAK_MODEL": "fake-model",
+            "PAK_ALLOW_NESTED_RUN": "1",
             "PAK_IDLE_TIMEOUT": "1",
             "FAKE_DRIVER_BIN": str(repo_root / "tmp" / "fake-driver"),
             "FAKE_DRIVER_STATE_FILE": str(repo_root / "tmp" / "driver-state.txt"),
@@ -258,6 +262,7 @@ def verify_resume_eligibility_consistency():
             "PAK_DRIVER_PLUGIN_PATH": str(repo_root / "plugins"),
             "PAK_DRIVER": "fake",
             "PAK_MODEL": "fake-model",
+            "PAK_ALLOW_NESTED_RUN": "1",
             "FAKE_DRIVER_BIN": str(repo_root / "tmp" / "fake-driver"),
             "FAKE_DRIVER_STATE_FILE": str(repo_root / "tmp" / "driver-state.txt"),
         }

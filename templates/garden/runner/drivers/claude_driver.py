@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from runner.plugin_api import DriverConfig
+from runner.transcript_support import build_unrendered_event_entry, extract_claude_content_text, stringify_payload
 
 
 class ClaudeDriver:
@@ -48,6 +49,70 @@ class ClaudeDriver:
             "num_turns": result_event.get("num_turns"),
             "duration_ms": result_event.get("duration_ms"),
         }
+
+    def normalize_transcript(self, *, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rendered: list[dict[str, Any]] = []
+        pending_tool_results: dict[str, dict[str, Any]] = {}
+
+        for index, event in enumerate(events):
+            matched = False
+            event_type = event.get("type")
+            message = event.get("message")
+            if event_type == "assistant" and isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    text_blocks: list[str] = []
+                    for block_index, block in enumerate(content):
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type == "text":
+                            text = block.get("text")
+                            if isinstance(text, str) and text.strip():
+                                text_blocks.append(text)
+                                matched = True
+                        elif block_type == "tool_use":
+                            tool_id = str(block.get("id") or f"tool-{index}-{block_index}")
+                            entry = {
+                                "order": index * 1000 + block_index,
+                                "kind": "tool_activity",
+                                "tool_name": str(block.get("name") or "tool_use"),
+                                "status": "completed",
+                                "exit_code": None,
+                                "invocation": stringify_payload(block.get("input")),
+                                "result_text": "",
+                                "result_label": "tool_result",
+                            }
+                            rendered.append(entry)
+                            pending_tool_results[tool_id] = entry
+                            matched = True
+
+                    if text_blocks:
+                        rendered.append(
+                            {
+                                "order": index * 1000 + 999,
+                                "kind": "assistant_message",
+                                "text": "\n\n".join(text_blocks),
+                            }
+                        )
+
+            if event_type == "user" and isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_use_id = str(block.get("tool_use_id") or "")
+                        entry = pending_tool_results.get(tool_use_id)
+                        if entry is None:
+                            continue
+                        entry["result_text"] = extract_claude_content_text(block.get("content"))
+                        matched = True
+
+            if not matched:
+                rendered.append(build_unrendered_event_entry(order=index * 1000, event=event))
+
+        return sorted(rendered, key=lambda item: int(item.get("order", 0)))
 
 
 PLUGIN = ClaudeDriver()
