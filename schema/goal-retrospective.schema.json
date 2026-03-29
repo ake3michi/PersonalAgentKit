@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2.local/schema/goal-retrospective.schema.json",
+  "title": "Retrospective Goal Payload",
+  "description": "The retrospective-specific payload used on evaluate goals submitted through `pak2 retrospective` or `system.submit.submit_retrospective_goal()`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "window",
+    "recent_run_limit",
+    "action_boundary"
+  ],
+  "properties": {
+    "window": {
+      "type": "string",
+      "description": "Window-selection policy for the retrospective evidence set.",
+      "enum": [
+        "since_last_retrospective_or_recent"
+      ]
+    },
+    "recent_run_limit": {
+      "type": "integer",
+      "description": "Fallback cap on substantive closed runs when no prior retrospective boundary exists.",
+      "minimum": 3,
+      "maximum": 10
+    },
+    "action_boundary": {
+      "type": "string",
+      "description": "Whether this retrospective stays observe-only or may queue one bounded follow-up goal.",
+      "enum": [
+        "observe_only",
+        "allow_one_bounded_follow_up_goal"
+      ]
+    }
+  }
+}

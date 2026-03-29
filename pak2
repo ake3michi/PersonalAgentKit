@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""pak2 — Personal Agent Kit 2 CLI"""
+import sys
+import pathlib
+
+# Allow running from anywhere: add the garden/pak2 source root to path
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from system.cli import main
+main()

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/plant",
+  "title": "Plant",
+  "description": "A named agent instance within a garden. Plants are context containers: they carry memory, skills, and knowledge loaded when a goal is dispatched to them. The garden presents as a single identity to the operator — plants are an internal concern.",
+  "type": "object",
+  "required": ["name", "seed", "status", "created_at", "commissioned_by"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "The plant's identity within the garden. Unique. Lowercase alphanumeric with hyphens, starting with a letter."
+    },
+    "seed": {
+      "type": "string",
+      "description": "The seed name this plant was commissioned from. It is persisted in meta.json for provenance, and seeded commissioning materializes plants/{name}/seed so a first blank-memory run can bootstrap from seeds/{seed-name}.md."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "archived"],
+      "description": "active: plant is available for goal dispatch. archived: plant is retired; goals will not be dispatched to it."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC. When this plant was commissioned."
+    },
+    "commissioned_by": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Name of the agent or operator that commissioned this plant."
+    }
+  },
+  "$defs": {
+    "notes": {
+      "description": "Plants do not own goals or runs. Goals are dispatched to plants via the goal's assigned_to field. Runs reference their plant via the run's plant field. All goals and runs live at garden level."
+    },
+    "context_loading": {
+      "description": "When a goal is dispatched to a plant, the driver always loads garden MOTIVATION.md. If memory/MEMORY.md exists and is non-blank, it also loads the plant's memory, skills, and knowledge. Otherwise, the driver may bootstrap from plants/{name}/seed by loading seeds/{seed-name}.md."
+    }
+  }
+}

@@ -1,85 +1,84 @@
-# PersonalAgentKit
+# PAK2
 
-An autonomous AI agent that names itself, builds its own faculties, and
-grows over time. Runs on top of [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-or [Codex](https://github.com/openai/codex).
+PAK2 is a seed for an agent you grow locally. You give it goals, it executes
+work, keeps a visible record of what happened, and becomes more tailored to
+you through use.
 
-## Quick start
+It starts as a working quickstart and grows into a bespoke system around your
+operator guidance, memory, and accumulated skills. PAK2 is source code you run
+yourself, not a hosted product.
 
-Prerequisites: `bash`, `python3`, `jq`, `git`, Claude Code CLI (or Codex CLI).
+## See It Run
 
-```bash
-# Clone the kit
-git clone https://github.com/gbelinsky/PersonalAgentKit my-agent
-cd my-agent
-
-# Create a setup directory next to the kit (not inside it)
-mkdir ../setup
-
-# Fill in who you are and what the agent is for
-cp shared/charter.md ../setup/charter.md
-edit ../setup/charter.md
-
-# Bootstrap and plant
-./personalagentkit-genesis          # defaults to claude
-./personalagentkit-genesis codex    # use codex as the default driver
-```
-
-Genesis reads `../setup/charter.md`. The optional argument sets the driver
-for genesis and becomes the default for all subsequent runs. It takes a few
-minutes. The agent will name itself, write its first memory, and leave you
-a message in `coordinator/inbox/`.
-
-## Drivers
-
-The kit ships with `claude` and `codex` drivers. Pass the driver name to
-genesis to select it:
+The fastest path from checkout to a live garden is:
 
 ```bash
-./personalagentkit-genesis claude   # Claude Code (default)
-./personalagentkit-genesis codex    # OpenAI Codex
+./pak2 init my-garden
+cd my-garden
+./pak2 genesis
+./pak2 cycle
 ```
 
-Per-goal routing is also supported via frontmatter:
-
-```markdown
----
-driver: codex
----
-# My goal
-```
-
-Additional drivers can be added as `runner/drivers/<name>_driver.py` plugins.
-
-Route multi-driver work through goal frontmatter and normal dispatch. Do not
-launch nested `./scripts/personalagentkit run ...` from inside an active run;
-if a run needs follow-up work, write or submit another goal instead. For rare
-debugging only, `PAK_ALLOW_NESTED_RUN=1` bypasses that guard explicitly.
-
-## Start the cycle
+With `./pak2 cycle` running, use another terminal for the interactive operator
+surface:
 
 ```bash
-cd coordinator
-./scripts/personalagentkit cycle
+./pak2 chat
 ```
 
-The agent tends itself every 10 minutes, assessing state and deciding what
-to do next. Monitor with `./scripts/personalagentkit watch`.
+Optional read-only observability:
 
-## Communicating with your agent
+```bash
+./pak2 dashboard
+```
 
-The agent writes messages to `coordinator/inbox/` as `NNN-to-{yourname}.md`.
-To reply, write `coordinator/inbox/NNN-reply.md`.
+## Customize It
 
-## Email (optional)
+`./pak2 init` gives you a fresh garden directory with:
 
-For email communication, sign up at [agentmail.to](https://agentmail.to)
-and place your API key in `secrets/agentmail-api-key.txt` in the garden before
-running `./hooks/setup-agentmail.sh` or first-use Agentmail hooks. The agent
-will find the skill documentation at
-`shared/skills/agentmail.md`, discover or create the shared inbox from the
-Agentmail API, and persist the non-secret result in `config/agentmail.env`.
+- a ready-to-run `CHARTER.md` copied from
+  [examples/charter-quickstart.md](examples/charter-quickstart.md)
+- `CHARTER.md.example` plus the rest of `examples/` for charter customization,
+  including scenario-driven starters for personal admin, research, product
+  work, and creative practice
+- `PAK2.toml`, written for the new garden
+- [PAK2.toml.example](PAK2.toml.example), which shows the full shipped config
+  surface: `[runtime]`, `[defaults]`, and `[garden]`
 
-## License
+Use `CHARTER.md` to define who the agent is for and what it should optimize
+around. Use `PAK2.toml` for your garden's active settings, and
+`PAK2.toml.example` as the reference when you want to change the runtime path,
+garden-wide driver/model/reasoning defaults, or the filesystem garden name.
 
-MIT
+`./pak2 init` can prefill the `[defaults]` section with `--default-driver`,
+`--default-model`, and `--default-reasoning-effort`.
+
+PAK2 is released under the [MIT License](LICENSE).
+
+## Operator, Garden, Plants
+
+PAK2 uses three plain-language roles:
+
+- The **operator** is the human giving direction, constraints, and oversight.
+- The **garden** is the persistent working entity that accepts goals, executes
+  them over time, and keeps the record.
+- **Plants** are the garden's internal specialists. The gardener plant is the
+  default executive faculty; additional plants are commissioned only when the
+  garden needs a new capability.
+
+From the outside, you interact with one garden. Plants are how the garden
+organizes its own work internally.
+
+## What To Read Next
+
+- [System overview](docs/system/level1.md)
+- [Startup contract](docs/system/level2.md)
+- [Plant model](docs/plant/level1.md)
+- [Goal model](docs/goal/level1.md)
+- [Motivation](MOTIVATION.md)
+- Charter examples:
+  [quickstart](examples/charter-quickstart.md),
+  [chief-of-staff](examples/charter-chief-of-staff.md),
+  [research-apprentice](examples/charter-research-apprentice.md),
+  [product-studio](examples/charter-product-studio.md),
+  [creative-practice](examples/charter-creative-practice.md)

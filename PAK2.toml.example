@@ -1,0 +1,15 @@
+# Example garden config. Copy the values you want into `PAK2.toml`.
+
+[runtime]
+# Runtime state lives under this path relative to the garden root.
+root = ".runtime"
+
+[defaults]
+# Optional garden-wide execution defaults. `pak2 init` can prefill these.
+driver = "codex"
+model = "gpt-5.4"
+reasoning_effort = "xhigh"
+
+[garden]
+# Optional filesystem reply directory name. Omit this section to keep `garden`.
+name = "my-garden"

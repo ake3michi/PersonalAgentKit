@@ -1,0 +1,480 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/event",
+  "title": "Event",
+  "description": "A named, timestamped, immutable record that something happened. Events are append-only. The log is audit history, not live state.",
+  "type": "object",
+  "required": ["ts", "type", "actor"],
+  "additionalProperties": false,
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp set by the system."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "GoalSubmitted",
+        "GoalTransitioned",
+        "GoalDispatched",
+        "GoalClosed",
+        "GoalSupplemented",
+        "DispatchPacketMaterialized",
+        "RunStarted",
+        "RunFinished",
+        "EvalSpawned",
+        "EvalClosed",
+        "TendStarted",
+        "TendFinished",
+        "InitiativeRefreshStarted",
+        "InitiativeRefreshFinished",
+        "ActiveThreadsRefreshStarted",
+        "ActiveThreadsRefreshFinished",
+        "DashboardInvocationStarted",
+        "DashboardInvocationFinished",
+        "ConversationHopQueued",
+        "ConversationHopQueueFailed",
+        "ConversationCheckpointWritten",
+        "MemoryUpdated",
+        "SkillAdded",
+        "SkillArchived",
+        "PlantCommissioned",
+        "PlantArchived",
+        "SystemError"
+      ]
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "run": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "conversation_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "goal_type": {
+      "type": "string",
+      "enum": ["build", "fix", "spike", "tend", "evaluate", "research", "converse"]
+    },
+    "goal_subtype": {
+      "type": "string",
+      "minLength": 1
+    },
+    "goal_priority": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "goal_origin": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_message_id": {
+      "type": "string",
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+    },
+    "source_goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "source_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "hop_goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "hop_requested_by": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "hop_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hop_automatic": {
+      "type": "boolean"
+    },
+    "hop_outcome": {
+      "type": "string"
+    },
+    "checkpoint_id": {
+      "type": "string",
+      "pattern": "^ckpt-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "checkpoint_requested_by": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "checkpoint_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "checkpoint_summary_path": {
+      "type": "string",
+      "pattern": "^checkpoints/ckpt-[0-9]{14}-[a-z0-9]{4}\\.md$"
+    },
+    "checkpoint_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_session_ordinal": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_session_turns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dashboard_invocation_id": {
+      "type": "string",
+      "pattern": "^dash-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "dashboard_mode": {
+      "type": "string",
+      "enum": ["once", "live"]
+    },
+    "dashboard_refresh_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "dashboard_tty": {
+      "type": "boolean"
+    },
+    "dashboard_outcome": {
+      "type": "string",
+      "enum": ["success", "interrupted", "failure"]
+    },
+    "dashboard_render_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dashboard_wall_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dashboard_record_path": {
+      "type": "string",
+      "pattern": "^dashboard/invocations/dash-[0-9]{14}-[a-z0-9]{4}\\.json$"
+    },
+    "active_threads_path": {
+      "type": "string",
+      "pattern": "^plants/[a-z][a-z0-9-]*/memory/active-threads\\.json$"
+    },
+    "active_threads_outcome": {
+      "type": "string",
+      "enum": ["success", "validation_rejected", "io_error"]
+    },
+    "active_threads_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "initiative_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "initiative_path": {
+      "type": "string",
+      "pattern": "^plants/[a-z][a-z0-9-]*/memory/initiatives/[a-z0-9-]+\\.json$"
+    },
+    "initiative_outcome": {
+      "type": "string",
+      "enum": ["success", "validation_rejected", "io_error"]
+    },
+    "initiative_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "from": {
+      "type": "string",
+      "enum": ["queued", "dispatched", "running", "completed", "evaluating", "closed"]
+    },
+    "to": {
+      "type": "string",
+      "enum": ["queued", "dispatched", "running", "completed", "evaluating", "closed"]
+    },
+    "goal_reason": {
+      "type": "string",
+      "enum": ["success", "failure", "cancelled", "dependency_impossible"]
+    },
+    "run_reason": {
+      "type": "string",
+      "enum": ["success", "failure", "killed", "timeout", "zero_output"]
+    },
+    "error_reason": {
+      "type": "string",
+      "enum": ["schema_violation", "invalid_transition", "submission_rejected", "validator_unavailable"]
+    },
+    "eval_goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "plant": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "trigger_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["post_genesis", "operator_request", "run_failure", "queued_attention_needed"]
+      }
+    },
+    "trigger_goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "trigger_run": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "follow_up_goal_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "memory_updated": {
+      "type": "boolean"
+    },
+    "operator_note_written": {
+      "type": "boolean"
+    },
+    "follow_up_goals": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+      }
+    },
+    "operator_note_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "packet_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "supplement_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "supplement_kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "supplement_chars": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "supplement_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "GoalSubmitted" } }, "required": ["type"] },
+      "then": { "required": ["goal"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "GoalTransitioned" } }, "required": ["type"] },
+      "then": { "required": ["goal", "from", "to"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "GoalDispatched" } }, "required": ["type"] },
+      "then": { "required": ["goal"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "GoalClosed" } }, "required": ["type"] },
+      "then": { "required": ["goal", "goal_reason"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "GoalSupplemented" } }, "required": ["type"] },
+      "then": { "required": ["goal"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "DispatchPacketMaterialized" } }, "required": ["type"] },
+      "then": { "required": ["goal", "run"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "RunStarted" } }, "required": ["type"] },
+      "then": { "required": ["goal", "run"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "RunFinished" } }, "required": ["type"] },
+      "then": { "required": ["goal", "run", "run_reason"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "EvalSpawned" } }, "required": ["type"] },
+      "then": { "required": ["goal", "eval_goal"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "EvalClosed" } }, "required": ["type"] },
+      "then": { "required": ["goal", "eval_goal", "goal_reason"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "TendStarted" } }, "required": ["type"] },
+      "then": { "required": ["goal", "run", "trigger_kinds"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "TendFinished" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "goal",
+          "run",
+          "follow_up_goal_count",
+          "memory_updated",
+          "operator_note_written"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ActiveThreadsRefreshStarted" } }, "required": ["type"] },
+      "then": {
+        "required": ["plant", "active_threads_path"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ActiveThreadsRefreshFinished" } }, "required": ["type"] },
+      "then": {
+        "required": ["plant", "active_threads_path", "active_threads_outcome"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "ActiveThreadsRefreshFinished" },
+          "active_threads_outcome": { "enum": ["validation_rejected", "io_error"] }
+        },
+        "required": ["type", "active_threads_outcome"]
+      },
+      "then": {
+        "required": ["active_threads_reason"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "InitiativeRefreshStarted" } }, "required": ["type"] },
+      "then": {
+        "required": ["plant", "initiative_id", "initiative_path"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "InitiativeRefreshFinished" } }, "required": ["type"] },
+      "then": {
+        "required": ["plant", "initiative_id", "initiative_path", "initiative_outcome"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "InitiativeRefreshFinished" },
+          "initiative_outcome": { "enum": ["validation_rejected", "io_error"] }
+        },
+        "required": ["type", "initiative_outcome"]
+      },
+      "then": {
+        "required": ["initiative_reason"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "DashboardInvocationStarted" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "dashboard_invocation_id",
+          "dashboard_mode",
+          "dashboard_refresh_seconds",
+          "dashboard_tty"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "DashboardInvocationFinished" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "dashboard_invocation_id",
+          "dashboard_mode",
+          "dashboard_refresh_seconds",
+          "dashboard_tty",
+          "dashboard_outcome",
+          "dashboard_render_count",
+          "dashboard_wall_ms",
+          "dashboard_record_path"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ConversationHopQueued" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "goal",
+          "run",
+          "conversation_id",
+          "hop_goal",
+          "hop_requested_by",
+          "hop_reason",
+          "hop_automatic"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ConversationHopQueueFailed" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "goal",
+          "run",
+          "conversation_id",
+          "hop_requested_by",
+          "hop_reason",
+          "hop_automatic",
+          "detail"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "ConversationCheckpointWritten" } }, "required": ["type"] },
+      "then": {
+        "required": [
+          "conversation_id",
+          "checkpoint_id",
+          "checkpoint_requested_by",
+          "checkpoint_reason",
+          "checkpoint_summary_path",
+          "source_message_id",
+          "source_session_ordinal",
+          "source_session_turns",
+          "checkpoint_count"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "SystemError" } }, "required": ["type"] },
+      "then": { "required": ["error_reason"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "PlantCommissioned" } }, "required": ["type"] },
+      "then": { "required": ["plant"] }
+    },
+    {
+      "if": { "properties": { "type": { "const": "PlantArchived" } }, "required": ["type"] },
+      "then": { "required": ["plant"] }
+    }
+  ]
+}

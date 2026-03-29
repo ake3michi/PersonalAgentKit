@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2.local/schema/dashboard-render.schema.json",
+  "title": "Dashboard Render Tree",
+  "description": "The machine-readable dashboard render tree returned by system.dashboard.build_render_tree().",
+  "type": "object",
+  "required": [
+    "generated_at",
+    "width",
+    "height_limit",
+    "layout",
+    "header",
+    "truncated",
+    "panels",
+    "rows",
+    "text_lines"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 80
+    },
+    "height_limit": {
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "layout": {
+      "type": "string",
+      "enum": [
+        "two-column",
+        "stacked"
+      ]
+    },
+    "header": {
+      "type": "string"
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "panels": {
+      "type": "object",
+      "required": [
+        "cycle_health",
+        "active_work",
+        "conversations",
+        "cost",
+        "alerts",
+        "recent_activity"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "cycle_health": {
+          "$ref": "#/$defs/cycle_health_panel"
+        },
+        "active_work": {
+          "$ref": "#/$defs/active_work_panel"
+        },
+        "conversations": {
+          "$ref": "#/$defs/conversations_panel"
+        },
+        "cost": {
+          "$ref": "#/$defs/cost_panel"
+        },
+        "alerts": {
+          "$ref": "#/$defs/alerts_panel"
+        },
+        "recent_activity": {
+          "$ref": "#/$defs/recent_activity_panel"
+        }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/render_row"
+      }
+    },
+    "text_lines": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "panel_key": {
+      "type": "string",
+      "enum": [
+        "cycle_health",
+        "active_work",
+        "conversations",
+        "cost",
+        "alerts",
+        "recent_activity"
+      ]
+    },
+    "panel": {
+      "type": "object",
+      "required": [
+        "title",
+        "body_lines"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "body_lines": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "render_row": {
+      "type": "object",
+      "required": [
+        "panel_keys"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "panel_keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/panel_key"
+          }
+        }
+      }
+    },
+    "cycle_health_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Cycle Health"
+            }
+          }
+        }
+      ]
+    },
+    "active_work_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Active Work"
+            }
+          }
+        }
+      ]
+    },
+    "conversations_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Conversations"
+            }
+          }
+        }
+      ]
+    },
+    "cost_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Cost"
+            }
+          }
+        }
+      ]
+    },
+    "alerts_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Alerts"
+            }
+          }
+        }
+      ]
+    },
+    "recent_activity_panel": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/panel"
+        },
+        {
+          "properties": {
+            "title": {
+              "const": "Recent Activity"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

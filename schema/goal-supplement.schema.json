@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/goal-supplement",
+  "title": "Goal Supplement",
+  "description": "An immutable pre-dispatch supplement persisted at goals/supplements/<goal-id>.jsonl.",
+  "type": "object",
+  "required": [
+    "id",
+    "goal",
+    "ts",
+    "actor",
+    "source",
+    "kind",
+    "content"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^supp-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "source_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["kind", "conversation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "conversation"
+        },
+        "conversation_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+        }
+      }
+    }
+  }
+}

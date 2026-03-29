@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/goal-plant-commission",
+  "title": "Plant Commission Goal Payload",
+  "description": "Structured contract for an ordinary build goal dedicated to later-plant commissioning. When executed through the helper, the commissioning run creates the plant from a seed and queues its first bounded goal with an automatic dependency on the commissioning goal.",
+  "type": "object",
+  "required": ["plant_name", "seed", "initial_goal"],
+  "additionalProperties": false,
+  "properties": {
+    "plant_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Name of the later plant to commission."
+    },
+    "seed": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Seed name to materialize for the later plant."
+    },
+    "initial_goal": {
+      "type": "object",
+      "required": ["type", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["build", "fix", "spike", "evaluate", "research"],
+          "description": "Type for the first bounded goal queued for the new plant."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable body for the first bounded goal."
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Optional priority override for the first bounded goal."
+        },
+        "driver": {
+          "type": "string",
+          "description": "Optional driver override for the first bounded goal."
+        },
+        "model": {
+          "type": "string",
+          "description": "Optional model override for the first bounded goal."
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "xhigh"],
+          "description": "Optional reasoning effort override for the first bounded goal."
+        }
+      }
+    }
+  }
+}

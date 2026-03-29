@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2/schema/initiative.schema.json",
+  "title": "Initiative Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "plant",
+    "title",
+    "status",
+    "approved_by",
+    "objective",
+    "scope_boundary",
+    "non_goals",
+    "success_checks",
+    "budget_policy",
+    "tranches",
+    "current_tranche_id",
+    "next_authorized_step",
+    "ledger",
+    "updated_at",
+    "updated_by_run"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "#/$defs/initiativeId"
+    },
+    "plant": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "desired",
+        "approved",
+        "active",
+        "paused",
+        "blocked",
+        "completed",
+        "abandoned"
+      ]
+    },
+    "approved_by": {
+      "$ref": "#/$defs/conversationApproval"
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope_boundary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "non_goals": {
+      "$ref": "#/$defs/nonEmptyStringList"
+    },
+    "success_checks": {
+      "$ref": "#/$defs/nonEmptyStringList"
+    },
+    "budget_policy": {
+      "$ref": "#/$defs/budgetPolicy"
+    },
+    "tranches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/tranche"
+      }
+    },
+    "current_tranche_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/trancheId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_authorized_step": {
+      "$ref": "#/$defs/nextAuthorizedStep"
+    },
+    "ledger": {
+      "$ref": "#/$defs/ledger"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_by_run": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    }
+  },
+  "$defs": {
+    "initiativeId": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "trancheId": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nonEmptyStringList": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      }
+    },
+    "goalType": {
+      "type": "string",
+      "enum": ["build", "fix", "spike", "evaluate", "research"]
+    },
+    "conversationApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "conversation_id", "message_id", "ts"],
+      "properties": {
+        "kind": {
+          "const": "conversation"
+        },
+        "conversation_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "budgetPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["track_only", "ceilinged"]
+        },
+        "notes": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "max_input_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_output_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_cache_read_tokens": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "track_only"
+              }
+            },
+            "required": ["mode"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["max_input_tokens"] },
+                { "required": ["max_output_tokens"] },
+                { "required": ["max_cache_read_tokens"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "ceilinged"
+              }
+            },
+            "required": ["mode"]
+          },
+          "then": {
+            "anyOf": [
+              { "required": ["max_input_tokens"] },
+              { "required": ["max_output_tokens"] },
+              { "required": ["max_cache_read_tokens"] }
+            ]
+          }
+        }
+      ]
+    },
+    "successor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition", "next_tranche_id", "summary"],
+      "properties": {
+        "condition": {
+          "type": "string",
+          "enum": [
+            "review_or_evaluate_recommends_next_tranche",
+            "initiative_complete_after_clean_review"
+          ]
+        },
+        "next_tranche_id": {
+          "anyOf": [
+            { "$ref": "#/$defs/trancheId" },
+            { "type": "null" }
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "tranche": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "objective",
+        "status",
+        "allowed_goal_types",
+        "execution_mode",
+        "review_policy",
+        "stop_rules",
+        "successor"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/trancheId"
+        },
+        "title": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "objective": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["planned", "active", "completed", "abandoned"]
+        },
+        "allowed_goal_types": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/goalType"
+          }
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": ["ordinary_goals_only", "bounded_campaign_optional"]
+        },
+        "review_policy": {
+          "const": "mandatory_review_or_evaluate_stop"
+        },
+        "stop_rules": {
+          "$ref": "#/$defs/nonEmptyStringList"
+        },
+        "successor": {
+          "$ref": "#/$defs/successor"
+        }
+      }
+    },
+    "nextAuthorizedStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tranche_id",
+        "status",
+        "goal_type",
+        "summary",
+        "may_start_bounded_campaign",
+        "stop_after"
+      ],
+      "properties": {
+        "tranche_id": {
+          "$ref": "#/$defs/trancheId"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ready", "waiting", "blocked", "done"]
+        },
+        "goal_type": {
+          "$ref": "#/$defs/goalType"
+        },
+        "summary": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "may_start_bounded_campaign": {
+          "type": "boolean"
+        },
+        "stop_after": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal_ids", "run_ids", "totals"],
+      "properties": {
+        "goal_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+          }
+        },
+        "run_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+          }
+        },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["input_tokens", "output_tokens", "cache_read_tokens"],
+          "properties": {
+            "input_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output_tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cache_read_tokens": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+# Charter
+
+This file defines who this garden serves and what it exists to do.
+The operator writes it before running genesis. Copy it to `CHARTER.md`
+and fill in each section.
+
+See `examples/` for complete charters you can use as-is or adapt. Start with
+`examples/charter-quickstart.md` if you want a ready-to-run first pass, or use
+the scenario charters there for a more opinionated starting point.
+
+---
+
+## Operator
+
+[Name. Background. How to reach you. Communication style — do you want
+frequent updates or batched reports? Do you respond quickly or slowly?
+Silence after a message means what?]
+
+## Mission
+
+[What this garden exists to do. Be concrete about current priorities but
+honest about what's unknown. If this is new, say so — don't pretend it
+has capabilities it hasn't built yet.]
+
+Priorities:
+- [Most important thing first]
+- [Then the next]
+- [No more than five]
+
+## Resources
+
+- **Compute:** [What's available — model, rate limits, subscription type]
+- **Budget:** [Cost expectations. What the limits are. Who pays.]
+- **Other tools:** [APIs, services, or capabilities the agent may use]
+
+## Authorization
+
+The entity is authorized to:
+- [What it may do without asking first]
+
+The entity is NOT authorized to:
+- [Hard limits — things that require your approval or are forbidden]
+
+## Long-term
+
+The system should eventually:
+- [Aspirational goals — where this is heading, not where it is now]

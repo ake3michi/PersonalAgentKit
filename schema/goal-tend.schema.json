@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2.local/schema/goal-tend.schema.json",
+  "title": "Tend Goal Payload",
+  "description": "The tend-specific payload required on raw goal submissions when type is 'tend'.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trigger_kinds"
+  ],
+  "properties": {
+    "trigger_kinds": {
+      "type": "array",
+      "description": "Ordered, unique tend trigger kinds.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "operator_request",
+          "post_genesis",
+          "queued_attention_needed",
+          "run_failure"
+        ]
+      }
+    },
+    "trigger_goal": {
+      "type": "string",
+      "description": "Goal id that caused the tend when applicable.",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "trigger_run": {
+      "type": "string",
+      "description": "Run id that caused the tend when applicable.",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    }
+  }
+}

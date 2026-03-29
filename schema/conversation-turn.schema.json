@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/conversation-turn",
+  "title": "Conversation Turn",
+  "description": "A durable record of one completed converse turn, persisted in conversations/<id>/turns.jsonl.",
+  "type": "object",
+  "required": [
+    "id",
+    "conversation_id",
+    "run_id",
+    "goal_id",
+    "ts",
+    "status",
+    "mode",
+    "diff_present",
+    "lineage",
+    "pressure",
+    "hop",
+    "session_id_before",
+    "session_id_after"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^turn-[0-9]{14}$"
+    },
+    "conversation_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "failure", "killed", "timeout", "zero_output"]
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["resumed", "fresh-handoff", "fresh-start"]
+    },
+    "diff_present": {
+      "type": "boolean"
+    },
+    "lineage": {
+      "type": "object",
+      "required": [
+        "session_ordinal",
+        "session_turn",
+        "label",
+        "checkpoint_id",
+        "checkpoint_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "session_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_turn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checkpoint_id": {
+          "type": ["string", "null"],
+          "pattern": "^ckpt-[0-9]{14}-[a-z0-9]{4}$"
+        },
+        "checkpoint_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "pressure": {
+      "$ref": "conversation.schema.json#/$defs/pressure"
+    },
+    "hop": {
+      "type": "object",
+      "required": [
+        "requested",
+        "reason",
+        "performed",
+        "checkpoint_id",
+        "error",
+        "automatic"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "requested": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "goal_id": {
+          "type": ["string", "null"],
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "performed": {
+          "type": "boolean"
+        },
+        "checkpoint_id": {
+          "type": ["string", "null"],
+          "pattern": "^ckpt-[0-9]{14}-[a-z0-9]{4}$"
+        },
+        "error": {
+          "type": ["string", "null"],
+          "minLength": 1
+        },
+        "automatic": {
+          "type": "boolean"
+        }
+      }
+    },
+    "session_id_before": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "session_id_after": {
+      "type": ["string", "null"],
+      "minLength": 1
+    }
+  }
+}

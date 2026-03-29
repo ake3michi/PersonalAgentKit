@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/operator-message",
+  "title": "Operator Message Record",
+  "description": "A validated durable emission record written to runs/<run-id>/operator-messages.jsonl for gardener-authored tend_survey and recently_concluded messages.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "sender",
+    "transcript_policy",
+    "delivery_policy",
+    "emitted_at",
+    "source_goal_id",
+    "source_run_id"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["tend_survey", "recently_concluded"]
+    },
+    "sender": {
+      "type": "string",
+      "const": "garden"
+    },
+    "origin": {
+      "$ref": "#/$defs/origin"
+    },
+    "transcript_policy": {
+      "type": "string",
+      "enum": ["canonical", "none"]
+    },
+    "delivery_policy": {
+      "type": "string",
+      "enum": ["reply_copy", "out_of_band_note"]
+    },
+    "emitted_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "source_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "delivery_path": {
+      "type": "string",
+      "pattern": "^inbox/[a-z][a-z0-9-]*/(?:notes/)?[^/]+\\.md$"
+    },
+    "conversation_message_id": {
+      "type": "string",
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "transcript_policy": {
+            "const": "canonical"
+          }
+        },
+        "required": ["transcript_policy"]
+      },
+      "then": {
+        "required": ["origin", "conversation_message_id"],
+        "properties": {
+          "delivery_policy": {
+            "const": "reply_copy"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "transcript_policy": {
+            "const": "none"
+          }
+        },
+        "required": ["transcript_policy"]
+      },
+      "then": {
+        "properties": {
+          "delivery_policy": {
+            "const": "out_of_band_note"
+          }
+        },
+        "required": ["delivery_path"],
+        "not": {
+          "required": ["origin", "conversation_message_id"]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "conversation_id", "ts"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "conversation"
+        },
+        "conversation_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

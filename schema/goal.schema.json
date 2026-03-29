@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/goal",
+  "title": "Goal",
+  "description": "A unit of work with a defined lifecycle. Goals are submitted, not created — the system assigns identity.",
+  "type": "object",
+  "required": ["id", "status", "type", "submitted_at", "submitted_by", "body"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$",
+      "description": "System-assigned. Format: N-slug where N is a positive integer (no upper limit, no leading zeros). Never set by submitter."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["queued", "dispatched", "running", "completed", "evaluating", "closed"],
+      "description": "Current lifecycle state. Transitions are enforced by the system."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["build", "fix", "spike", "tend", "evaluate", "research", "converse"],
+      "description": "What kind of work this is. Determines reflection requirements and spawn_eval eligibility. 'converse' is reserved for the somatic loop — it routes to the conversation handler."
+    },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp. System-assigned at submission."
+    },
+    "submitted_by": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Identity of the submitter: 'operator' or the agent's name. Lowercase alphanumeric and hyphens, starting with a letter."
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable description of the work. What to do and why."
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 5,
+      "description": "Dispatch priority. 1 = most urgent, 10 = someday. Lower dispatches first."
+    },
+    "assigned_to": {
+      "type": "string",
+      "description": "Plant name to route this goal to. Omit to let the dispatcher assign."
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+      },
+      "description": "Goal IDs that must be closed before this goal can be dispatched."
+    },
+    "not_before": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Do not dispatch before this UTC timestamp. Must not be earlier than submitted_at (enforced by validator)."
+    },
+    "spawn_eval": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, spawn an evaluate goal when this goal reaches completed. Distinct from goal type 'evaluate'."
+    },
+    "plant_commission": {
+      "$ref": "goal-plant-commission.schema.json",
+      "description": "Optional later-plant commissioning payload for an ordinary `build` goal assigned to `gardener`."
+    },
+    "retrospective": {
+      "$ref": "goal-retrospective.schema.json",
+      "description": "Optional retrospective payload for evaluate goals submitted through the manual retrospective protocol."
+    },
+    "parent_goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$",
+      "description": "Set by system when this is an evaluate goal. ID of the goal being evaluated."
+    },
+    "origin": {
+      "$ref": "#/$defs/conversation_origin",
+      "description": "Optional conversation linkage for durable non-'converse' goals that preserve operator-request provenance outside a live converse submission."
+    },
+    "driver": {
+      "type": "string",
+      "description": "Override the default execution driver for this goal."
+    },
+    "model": {
+      "type": "string",
+      "description": "Override the default model for this goal."
+    },
+    "reasoning_effort": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "xhigh"],
+      "description": "Optional reasoning effort override for compatible drivers."
+    },
+    "closed_reason": {
+      "type": "string",
+      "enum": ["success", "failure", "cancelled", "dependency_impossible"],
+      "description": "Required when status is closed. Forbidden when status is not closed."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["plant_commission"] },
+      "then": {
+        "required": ["assigned_to", "type"],
+        "properties": {
+          "type": { "const": "build" },
+          "assigned_to": { "const": "gardener" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "closed" } }, "required": ["status"] },
+      "then": { "required": ["closed_reason"] }
+    },
+    {
+      "if": { "not": { "properties": { "status": { "const": "closed" } }, "required": ["status"] } },
+      "then": { "not": { "required": ["closed_reason"] } }
+    }
+  ],
+  "$defs": {
+    "conversation_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "conversation_id", "ts"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "conversation",
+          "description": "Conversation linkage kind. The only accepted value is 'conversation'."
+        },
+        "conversation_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$",
+          "description": "Conversation id whose operator request originated the durable work."
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$",
+          "description": "Optional source message id inside the originating conversation."
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 UTC timestamp for the originating conversation linkage."
+        }
+      }
+    },
+    "notes": {
+      "id_assignment": "The id field is enforced as system-assigned by the submission validator, not by this schema. A raw JSON validator will not catch a submitter setting id.",
+      "transitions": "Valid transitions are documented in docs/goal/level3.md. This schema validates field shapes only, not transition sequences."
+    }
+  }
+}

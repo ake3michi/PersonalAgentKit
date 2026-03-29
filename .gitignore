@@ -1,5 +1,4 @@
-config/*.env
-secrets/*.txt
-!config/.gitkeep
-!config/*.example
-!secrets/.gitkeep
+__pycache__/
+*.pyc
+*.pyo
+.runtime/

@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/conversation-checkpoint",
+  "title": "Conversation Checkpoint",
+  "description": "A durable handoff/checkpoint record persisted in conversations/<id>/checkpoints.jsonl.",
+  "type": "object",
+  "required": [
+    "id",
+    "conversation_id",
+    "ts",
+    "requested_by",
+    "reason",
+    "compacted_through",
+    "source_session_id",
+    "source_session_ordinal",
+    "source_session_turns",
+    "summary_path",
+    "run_id",
+    "driver",
+    "model",
+    "pressure"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^ckpt-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "conversation_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requested_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compacted_through": {
+      "type": "string",
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+    },
+    "source_session_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "source_session_ordinal": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_session_turns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "summary_path": {
+      "type": "string",
+      "pattern": "^checkpoints/ckpt-[0-9]{14}-[a-z0-9]{4}\\.md$"
+    },
+    "run_id": {
+      "type": ["string", "null"],
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "driver": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "model": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "pressure": {
+      "anyOf": [
+        { "$ref": "conversation.schema.json#/$defs/pressure" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

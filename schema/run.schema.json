@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/run",
+  "title": "Run",
+  "description": "A single attempt to fulfill a goal. Immutable once terminal. The record of what happened, what it cost, and what was learned.",
+  "type": "object",
+  "required": ["id", "goal", "plant", "status", "started_at", "driver", "model"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$",
+      "description": "System-assigned. Format: N-slug-rN where N is the goal number (positive integer, no upper limit) and rN is the attempt number starting at r1. r0 is invalid."
+    },
+    "goal": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$",
+      "description": "The goal ID this run is attempting."
+    },
+    "plant": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "The plant that executed this run. Links the run to its execution context (memory, skills, knowledge)."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["running", "success", "failure", "killed", "timeout", "zero_output"],
+      "description": "Terminal statuses are immutable. A run in 'running' that has no activity for the watchdog interval becomes 'killed'."
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC. Written at run start, before the subprocess launches."
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC. Written when the run reaches a terminal status."
+    },
+    "driver": {
+      "type": "string",
+      "description": "Execution driver used (e.g. 'claude', 'codex')."
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier used for this run."
+    },
+    "worktree_baseline": {
+      "type": "object",
+      "required": ["captured_at", "tracked_dirty_paths", "untracked_dirty_count", "untracked_dirty_roots"],
+      "additionalProperties": false,
+      "properties": {
+        "captured_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 UTC timestamp captured just before the run directory is created."
+        },
+        "tracked_dirty_paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Tracked paths already dirty in the garden worktree when the run opened."
+        },
+        "untracked_dirty_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of untracked paths already present when the run opened."
+        },
+        "untracked_dirty_roots": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Distinct top-level roots represented in the pre-existing untracked paths."
+        }
+      },
+      "description": "Optional system-managed pre-edit git baseline for non-converse runs when the garden root is in a readable git worktree. This is path-level provenance only; it does not attribute later hunks automatically."
+    },
+    "cost": {
+      "type": "object",
+      "required": ["source"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cache_read_tokens": { "type": "integer", "minimum": 0 },
+        "actual_usd": { "type": "number", "minimum": 0 },
+        "source": {
+          "type": "string",
+          "enum": ["provider", "estimated", "unknown"],
+          "description": "'provider' = reported by the API. 'estimated' = computed locally. 'unknown' = driver did not report cost."
+        }
+      },
+      "description": "Cost is always recorded, even if unknown. 'unknown' is a named state, not an absence."
+    },
+    "reflection": {
+      "type": "string",
+      "description": "What was learned, not what was done. Required by the validator (not this schema) for terminal runs of goal type build, fix, evaluate, and tend. The run schema cannot enforce this because it does not know the goal type — the validator cross-references goal.type at close time."
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths to files produced or modified by this run, relative to the garden root."
+    },
+    "failure_reason": {
+      "type": "string",
+      "enum": ["failure", "killed", "timeout", "zero_output"],
+      "description": "Required when status is failure, killed, timeout, or zero_output. Matches the run_reason codes in the event schema."
+    },
+    "num_turns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of agent turns in this run."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "enum": ["failure", "killed", "timeout", "zero_output"] } },
+        "required": ["status"]
+      },
+      "then": { "required": ["failure_reason"] }
+    },
+    {
+      "if": {
+        "properties": { "status": { "enum": ["success", "failure", "killed", "timeout", "zero_output"] } },
+        "required": ["status"]
+      },
+      "then": { "required": ["completed_at", "cost"] }
+    }
+  ],
+  "$defs": {
+    "immutability": {
+      "description": "Once status is terminal, the run record is never modified. Annotations (e.g. operator notes) are separate files, never edits to this record."
+    },
+    "watchdog": {
+      "description": "A run in 'running' status with no events.jsonl activity for the configured watchdog interval is transitioned to 'killed' by the system on the next reconciliation pass."
+    }
+  }
+}

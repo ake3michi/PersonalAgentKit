@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2.local/schema/dashboard-invocation.schema.json",
+  "title": "Dashboard Invocation",
+  "description": "A terminal dashboard invocation record persisted at dashboard/invocations/<id>.json.",
+  "type": "object",
+  "required": [
+    "id",
+    "actor",
+    "started_at",
+    "completed_at",
+    "root",
+    "mode",
+    "refresh_seconds",
+    "tty",
+    "render_count",
+    "outcome",
+    "cost"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^dash-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "source_goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "source_run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["once", "live"]
+    },
+    "refresh_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "tty": {
+      "type": "boolean"
+    },
+    "render_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["success", "interrupted", "failure"]
+    },
+    "error_detail": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cost": {
+      "type": "object",
+      "required": ["source", "wall_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["measured"]
+        },
+        "wall_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "outcome": { "const": "failure" } },
+        "required": ["outcome"]
+      },
+      "then": { "required": ["error_detail"] }
+    },
+    {
+      "if": {
+        "properties": { "outcome": { "const": "success" } },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "render_count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  ]
+}

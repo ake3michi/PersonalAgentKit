@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/conversation",
+  "title": "Conversation",
+  "description": "Conversation metadata persisted at conversations/<id>/meta.json.",
+  "type": "object",
+  "required": [
+    "id",
+    "status",
+    "channel",
+    "channel_ref",
+    "presence_model",
+    "started_at",
+    "last_activity_at",
+    "context_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$",
+      "description": "System-assigned conversation ID. Format: N-slug."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["open", "closed", "archived"]
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1
+    },
+    "channel_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "presence_model": {
+      "type": "string",
+      "enum": ["sync", "async"]
+    },
+    "started_by": {
+      "type": "string",
+      "enum": ["operator", "system"]
+    },
+    "participants": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_activity_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "context_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "compacted_through": {
+      "type": ["string", "null"],
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+    },
+    "session_ordinal": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "session_turns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "session_started_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "checkpoint_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_checkpoint_id": {
+      "type": ["string", "null"],
+      "pattern": "^ckpt-[0-9]{14}-[a-z0-9]{4}$"
+    },
+    "last_checkpoint_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "last_turn_mode": {
+      "type": ["string", "null"],
+      "enum": ["resumed", "fresh-handoff", "fresh-start", null]
+    },
+    "last_turn_run_id": {
+      "type": ["string", "null"],
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "last_pressure": {
+      "anyOf": [
+        { "$ref": "#/$defs/pressure" },
+        { "type": "null" }
+      ]
+    },
+    "pending_hop": {
+      "anyOf": [
+        { "$ref": "#/$defs/pending_hop" },
+        { "type": "null" }
+      ]
+    },
+    "post_reply_hop": {
+      "anyOf": [
+        { "$ref": "#/$defs/post_reply_hop" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "$defs": {
+    "pressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "band": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0
+        },
+        "needs_hop": {
+          "type": "boolean"
+        },
+        "prompt_source": {
+          "type": "string",
+          "enum": ["resume-session", "summary+tail", "full-history"]
+        },
+        "summary_present": {
+          "type": "boolean"
+        },
+        "history_messages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "history_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tail_messages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tail_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summary_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "prompt_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "session_turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provider_input_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "provider_cached_input_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "provider_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "thresholds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tail_messages": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tail_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "prompt_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "session_turns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "input_tokens": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "pending_hop": {
+      "type": "object",
+      "required": ["requested_at", "requested_by", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "requested_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "requested_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "post_reply_hop": {
+      "type": "object",
+      "required": [
+        "requested_at",
+        "requested_by",
+        "reason",
+        "automatic",
+        "source_goal_id",
+        "source_run_id",
+        "source_reply_message_id",
+        "source_reply_recorded_at",
+        "source_session_id",
+        "source_session_ordinal",
+        "source_session_turns",
+        "pressure",
+        "goal_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "requested_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "requested_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "automatic": {
+          "type": "boolean"
+        },
+        "source_goal_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "source_run_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+        },
+        "source_reply_message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+        },
+        "source_reply_recorded_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_session_ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_session_turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pressure": {
+          "$ref": "#/$defs/pressure"
+        },
+        "goal_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        }
+      }
+    }
+  }
+}

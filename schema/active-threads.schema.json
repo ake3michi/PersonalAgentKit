@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2/schema/active-threads.schema.json",
+  "title": "Active Threads Artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "captured_at",
+    "captured_by_run",
+    "plant",
+    "summary",
+    "threads",
+    "recent_updates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "captured_by_run": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "plant": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "threads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/thread"
+      }
+    },
+    "recent_updates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/recentUpdate"
+      }
+    }
+  },
+  "$defs": {
+    "threadId": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "thread": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "state",
+        "priority",
+        "last_changed_at",
+        "summary",
+        "current_focus",
+        "next_step",
+        "related_thread_ids",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/threadId"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "active",
+            "near_done",
+            "watching",
+            "blocked"
+          ]
+        },
+        "priority": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "secondary",
+            "background"
+          ]
+        },
+        "last_changed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "current_focus": {
+          "type": "string",
+          "minLength": 1
+        },
+        "next_step": {
+          "type": "string",
+          "minLength": 1
+        },
+        "related_thread_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/threadId"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "recentUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ts",
+        "summary",
+        "thread_ids",
+        "evidence"
+      ],
+      "properties": {
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thread_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/threadId"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

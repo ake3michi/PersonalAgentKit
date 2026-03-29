@@ -1,0 +1,570 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pak2.local/schema/dashboard-snapshot.schema.json",
+  "title": "Dashboard Snapshot Tree",
+  "description": "The machine-readable dashboard snapshot tree returned by system.dashboard.build_snapshot_tree().",
+  "type": "object",
+  "required": [
+    "root",
+    "generated_at",
+    "state",
+    "alert_counts",
+    "cycle_health",
+    "active_work",
+    "conversations",
+    "cost",
+    "alerts",
+    "recent_activity"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "root": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "state": {
+      "$ref": "#/$defs/dashboard_state"
+    },
+    "alert_counts": {
+      "type": "object",
+      "required": [
+        "critical",
+        "warning",
+        "info"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "critical": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "warning": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "info": {
+          "$ref": "#/$defs/non_negative_integer"
+        }
+      }
+    },
+    "cycle_health": {
+      "$ref": "#/$defs/cycle_health"
+    },
+    "active_work": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/goal_entry"
+      }
+    },
+    "conversations": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/conversation_entry"
+      }
+    },
+    "cost": {
+      "$ref": "#/$defs/cost_summary"
+    },
+    "alerts": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "$ref": "#/$defs/alert"
+      }
+    },
+    "recent_activity": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/recent_event"
+      }
+    }
+  },
+  "$defs": {
+    "non_negative_integer": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullable_non_negative_integer": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_string": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dashboard_state": {
+      "type": "string",
+      "enum": [
+        "active",
+        "stuck",
+        "idle"
+      ]
+    },
+    "goal_type": {
+      "type": "string",
+      "enum": [
+        "build",
+        "fix",
+        "spike",
+        "tend",
+        "evaluate",
+        "research",
+        "converse"
+      ]
+    },
+    "run_status": {
+      "type": "string",
+      "enum": [
+        "running",
+        "success",
+        "failure",
+        "killed",
+        "timeout",
+        "zero_output"
+      ]
+    },
+    "cycle_health": {
+      "type": "object",
+      "required": [
+        "coordinator_process_status",
+        "coordinator_process_count",
+        "work_status",
+        "open_work_count",
+        "freshest_run_output_age_seconds",
+        "running_runs",
+        "queued_goals",
+        "eligible_queued",
+        "blocked_queued",
+        "last_coordinator_event_age_seconds",
+        "watchdog_seconds",
+        "poll_interval_seconds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "coordinator_process_status": {
+          "type": "string",
+          "enum": [
+            "up",
+            "down"
+          ]
+        },
+        "coordinator_process_count": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "work_status": {
+          "$ref": "#/$defs/dashboard_state"
+        },
+        "open_work_count": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "freshest_run_output_age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "running_runs": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "queued_goals": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "eligible_queued": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "blocked_queued": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "last_coordinator_event_age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "watchdog_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "goal_entry": {
+      "type": "object",
+      "required": [
+        "goal_id",
+        "goal_type",
+        "status",
+        "plant",
+        "priority",
+        "age_seconds",
+        "bucket",
+        "blocked_reason",
+        "current_run_id",
+        "current_run_status",
+        "run_age_seconds",
+        "run_silence_age_seconds",
+        "run_event_count",
+        "run_lifecycle_phase",
+        "submitted_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "goal_type": {
+          "$ref": "#/$defs/goal_type"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "dispatched",
+            "running",
+            "completed",
+            "evaluating"
+          ]
+        },
+        "plant": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "bucket": {
+          "type": "string",
+          "enum": [
+            "running",
+            "active",
+            "eligible",
+            "blocked"
+          ]
+        },
+        "blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "dependency",
+            "not_before",
+            "conversation_hop",
+            "plant_busy",
+            "unassigned",
+            null
+          ]
+        },
+        "current_run_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "current_run_status": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/run_status"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "run_age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "run_silence_age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "run_event_count": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "run_lifecycle_phase": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "submitted_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "conversation_entry": {
+      "type": "object",
+      "required": [
+        "conversation_id",
+        "last_activity_age_seconds",
+        "session_ordinal",
+        "session_turns",
+        "mode",
+        "pressure_band",
+        "pressure_score",
+        "needs_hop",
+        "pending_hop",
+        "active_run_id",
+        "active_phase",
+        "last_turn_run_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "last_activity_age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "session_ordinal": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "session_turns": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "fresh-start",
+            "fresh-handoff",
+            "resumed"
+          ]
+        },
+        "pressure_band": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical",
+            "unknown"
+          ]
+        },
+        "pressure_score": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "needs_hop": {
+          "type": "boolean"
+        },
+        "pending_hop": {
+          "type": "boolean"
+        },
+        "active_run_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "active_phase": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "last_turn_run_id": {
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    },
+    "cost_run": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "goal_id",
+        "driver",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "driver": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "model": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "input_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "output_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "cache_read_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        }
+      }
+    },
+    "cost_summary": {
+      "type": "object",
+      "required": [
+        "today_input_tokens",
+        "today_output_tokens",
+        "today_cache_read_tokens",
+        "unknown_completed_runs",
+        "latest_completed_run",
+        "top_input_runs",
+        "active_driver_models"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "today_input_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "today_output_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "today_cache_read_tokens": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "unknown_completed_runs": {
+          "$ref": "#/$defs/non_negative_integer"
+        },
+        "latest_completed_run": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/cost_run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "top_input_runs": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/cost_run"
+          }
+        },
+        "active_driver_models": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "alert": {
+      "type": "object",
+      "required": [
+        "severity",
+        "subject",
+        "identifier",
+        "reason",
+        "age_seconds"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "critical",
+            "warning",
+            "info"
+          ]
+        },
+        "subject": {
+          "type": "string",
+          "enum": [
+            "run",
+            "goal",
+            "conversation",
+            "cycle",
+            "cost"
+          ]
+        },
+        "identifier": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        }
+      }
+    },
+    "recent_event": {
+      "type": "object",
+      "required": [
+        "ts",
+        "event_type",
+        "goal_id",
+        "goal_type",
+        "goal_subtype",
+        "conversation_id",
+        "run_id",
+        "reason",
+        "checkpoint_id",
+        "hop_outcome",
+        "age_seconds",
+        "from_status",
+        "to_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_type": {
+          "type": "string"
+        },
+        "goal_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "goal_type": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/goal_type"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "goal_subtype": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "conversation_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "reason": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "checkpoint_id": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "hop_outcome": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "age_seconds": {
+          "$ref": "#/$defs/nullable_non_negative_integer"
+        },
+        "from_status": {
+          "$ref": "#/$defs/nullable_string"
+        },
+        "to_status": {
+          "$ref": "#/$defs/nullable_string"
+        }
+      }
+    }
+  }
+}

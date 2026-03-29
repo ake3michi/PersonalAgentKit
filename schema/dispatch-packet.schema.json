@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/dispatch-packet",
+  "title": "Dispatch Packet",
+  "description": "The frozen pre-dispatch packet persisted at runs/<run-id>/dispatch-packet.json for conversation-origin durable work.",
+  "type": "object",
+  "required": [
+    "goal_id",
+    "run_id",
+    "cutoff",
+    "origin",
+    "goal_body",
+    "supplement_count",
+    "supplement_chars",
+    "supplements"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "goal_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+-r[1-9][0-9]*$"
+    },
+    "cutoff": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "origin": {
+      "$ref": "#/$defs/origin"
+    },
+    "goal_body": {
+      "type": "string",
+      "minLength": 1
+    },
+    "supplement_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "supplement_chars": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "supplements": {
+      "type": "array",
+      "items": {
+        "$ref": "goal-supplement.schema.json"
+      }
+    }
+  },
+  "$defs": {
+    "origin": {
+      "type": "object",
+      "required": ["kind", "conversation_id", "ts"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "conversation"
+        },
+        "conversation_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+        }
+      }
+    }
+  }
+}

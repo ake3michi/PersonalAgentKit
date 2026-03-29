@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pak2/message",
+  "title": "Conversation Message",
+  "description": "A single immutable message persisted as one line in conversations/<id>/messages.jsonl.",
+  "type": "object",
+  "required": ["id", "conversation_id", "ts", "sender", "content", "channel"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$",
+      "description": "System-assigned. Format: msg-<compact-ts>-<3-char-sender-prefix>-<4-char-random>."
+    },
+    "conversation_id": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*-[a-z0-9-]+$"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sender": {
+      "type": "string",
+      "minLength": 1
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1
+    },
+    "channel": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reply_to": {
+      "type": ["string", "null"],
+      "pattern": "^msg-[0-9]{14}-[a-z]{3}-[a-z0-9]{4}$"
+    }
+  }
+}
